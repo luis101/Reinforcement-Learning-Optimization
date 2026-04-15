@@ -9,7 +9,6 @@ from typing import Literal
 
 @dataclass
 class EnvironmentConfig:
-
     """Portfolio environment settings"""
 
     # Portfolio constraints - determines the action space and risk limits
@@ -40,15 +39,41 @@ class EnvironmentConfig:
 
 
 @dataclass
+class BacktestConfig:
+    """Configuration for walk-forward optimization and backtesting."""
+
+    # Window settings
+    train_window_years: float = 5.0  # Training window in years - Amount of historical data to train on for each window
+    step_size: int = 1  # Roll forward by N months or weeks for the next window
+
+    # Training per window
+    episodes_per_window: int = 200  # Episodes to train each window
+    warmstart: bool = True  # Initialize from previous window's model
+    warmstart_lr_factor: float = 0.3  # Reduce LR when warm-starting
+
+    # Early stopping within each window
+    patience: int = 30  # Stop if no improvement for N episodes
+    min_episodes: int = 50  # Always train at least this many episodes
+
+    # Universe handling
+    min_active_stocks: int = 30  # Minimum number of active stocks required
+    handle_delistings: Literal["mask", "fill_zero"] = "mask"
+
+    # Output
+    save_window_models: bool = False
+    output_dir: str = "walkforward_results"
+
+
+@dataclass
 class FeatureConfig:
     """Feature engineering settings"""
 
     # Return windows
-    return_windows: list[int] = [21, 63, 128, 252]
+    return_windows: list[int] = field(default_factory=lambda: [21, 63, 128, 252])
 
     # Technical indicators
-    volatility_windows: list[int] = [21, 63, 128, 252]
-    momentum_windows: list[int] = [21, 63, 128, 252]
+    volatility_windows: list[int] = field(default_factory=lambda: [21, 63, 128, 252]) 
+    momentum_windows: list[int] = field(default_factory=lambda: [21, 63, 128, 252])
     rsi_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -69,7 +94,7 @@ class NetworkConfig:
     """Neural network architecture settings"""
 
     # Feature extraction
-    feature_hidden_dims: list[int] = [256, 128]
+    feature_hidden_dims: list[int] = field(default_factory=lambda: [256, 128])
 
     # Cross-asset attention
     use_attention: bool = True
@@ -143,3 +168,4 @@ class Config:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    backtest: BacktestConfig = field(default_factory=BacktestConfig)

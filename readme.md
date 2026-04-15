@@ -24,13 +24,18 @@ Raw actions are mapped to valid weights through an **action processing** layer: 
 | `agent.py` | PPO agent with GAE and rollout buffer |
 | `trainer.py` | Training loop with evaluation and checkpointing |
 | `utils.py` | Performance metrics and plotting utilities |
-| `main.py` | Example usage with synthetic data |
+| `universe.py` | Dynamic stock universe handling (IPOs and delistings) |
+| `walkforward.py` | Walk-forward optimization engine |
+| `main.py` | Example: single-window training with synthetic data |
+| `main_walkforward.py` | Example: full walk-forward backtest |
 
 ## Quickstart
 
 ```bash
 pip install torch pandas numpy
 ```
+
+**Single-window training:**
 
 ```python
 from rl_portfolio import Config, create_and_train
@@ -39,10 +44,29 @@ from rl_portfolio import Config, create_and_train
 agent, results = create_and_train(prices, Config())
 ```
 
-Or run the included example with synthetic data:
+**Walk-forward optimization** (recommended for production backtesting):
+
+```python
+from rl_portfolio import Config, EnvironmentConfig
+from rl_portfolio.walkforward import WalkForwardEngine, WalkForwardConfig
+
+wf_config = WalkForwardConfig(
+    train_window_years=5.0,   # Train on 5 years of data
+    step_months=1,            # Roll forward monthly
+    episodes_per_window=200,  # Training intensity per window
+    warmstart=True,           # Initialize from previous window's model
+    rl_config=Config(env=EnvironmentConfig(mode="long_only")),
+)
+
+engine = WalkForwardEngine(prices, wf_config)
+results = engine.run()
+```
+
+Or run the included examples:
 
 ```bash
-python -m rl_portfolio.main
+python -m rl_portfolio.main               # Single window
+python -m rl_portfolio.main_walkforward   # Full walk-forward
 ```
 
 ## Configuration
@@ -92,3 +116,20 @@ The feature engine computes per-stock and market-level indicators from raw price
 - pandas
 - NumPy
 - matplotlib (optional, for plotting)
+
+## Walk-Forward Strategy
+
+The walk-forward engine implements a rolling-window approach suitable for long time series (25–30 years) with a dynamic stock universe:
+
+```
+Year:  1997 ──────────── 2002 ──── 2003 ──── 2004 ─────────── 2026
+       │◄── 5yr train ──►│◄─ OOS ─►│
+                │◄── 5yr train ──►│◄─ OOS ─►│
+                         │◄── 5yr train ──►│◄─ OOS ─►│  ...
+```
+
+Each window trains a fresh (or warm-started) PPO agent on 5 years of daily data, then applies the learned weights deterministically to the next month. The window rolls forward by one month and repeats. This produces a fully out-of-sample return series spanning ~22 years.
+
+**Dynamic universe handling:** Stocks may IPO or delist during any window. The `DynamicUniverse` class tracks each stock's lifecycle and produces boolean masks. Inactive stock slots receive large negative logits before the softmax/tanh layer, driving their weights to zero. Weights are renormalized over active stocks only. Delisted stocks retain their terminal returns in the training data to avoid survivorship bias.
+
+**Warm-starting:** By default, each window initializes the network from the previous window's final parameters with a reduced learning rate (0.3×). This cuts training time by roughly 50–70% compared to training from scratch, since the model only needs to adapt to the incremental data shift rather than learn from zero. Early stopping (patience on rolling reward) further avoids wasted computation.
