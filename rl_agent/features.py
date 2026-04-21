@@ -8,7 +8,6 @@ look-ahead bias.
 
 import numpy as np
 import pandas as pd
-from typing import Literal
 
 from .config import FeatureConfig
 
@@ -30,7 +29,7 @@ class FeatureConstructor:
 
         # Pre-compute all features (stored as DataFrames aligned to prices index)
         self._features: dict[str, pd.DataFrame] = {}
-        self._build_all_features()
+        self._build_features()
 
     def get_state_features(self, date_idx: int) -> np.ndarray:
         """
@@ -164,7 +163,7 @@ class FeatureConstructor:
         # Dispersion: cross-sectional stdev of returns (short-term and long-term)
         for w in [21, 252]:
             self._features[f"dispersion_{w}d"] = pd.DataFrame(
-                ret.rolling(w).std(axis=1).values,
+                ret.std(axis=1).rolling(w).mean().values,
                 index=self.prices.index,
                 columns=[f"dispersion_{w}d"],
             )

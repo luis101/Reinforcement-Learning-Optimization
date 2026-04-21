@@ -2,7 +2,7 @@
 Configuration of the RL portfolio optimization framework.
 Setting all hyperparameters and architectural choices.
 """
-
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -32,6 +32,7 @@ class EnvironmentConfig:
     risk_free_rate: float = 0.0  # Annualized risk-free rate
     drawdown_penalty: float = 0.5  # Penalty weight for drawdowns
     turnover_penalty: float = 0.1  # Penalty weight for portfolio turnover
+    target_returns: pd.DataFrame | None = None  # Optional benchmark returns for MSE reward
 
     # Data lookback for state construction - determines how much historical data the agent sees
     lookback_window: int = 252  # with 63 ~3 months of trading days

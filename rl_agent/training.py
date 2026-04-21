@@ -14,12 +14,9 @@ from pathlib import Path
 from .config import Config
 from .environment import PortfolioEnv
 from .algo import PPOAgent, Transition
-from .utils import (
-    compute_portfolio_metrics,
-    evaluate_agent,
-    format_metrics,
-    compute_benchmark_returns,
-)
+from .utils import (evaluate_agent, format_metrics,
+                    compute_portfolio_metrics, compute_benchmark_returns,
+                    plot_training_results)
 
 
 class Train:
@@ -141,7 +138,7 @@ class Train:
                 is_best = sharpe > self.best_val_sharpe
 
                 print(
-                    f"  [Eval ep {episode}] "
+                    f"[Eval ep {episode}] "
                     f"Sharpe: {sharpe:.3f} | "
                     f"Return: {metrics.get('total_return', 0):.2%} | "
                     f"MaxDD: {metrics.get('max_drawdown', 0):.2%}"
@@ -155,9 +152,6 @@ class Train:
             # Checkpointing
             if episode % self.tc.save_frequency == 0:
                 self.agent.save(str(self.ckpt_dir / f"agent_ep{episode}.pt"))
-
-
-
 
         # Final evaluation
         print("\n" + "=" * 70)
@@ -186,55 +180,3 @@ class Train:
             "final_eval": final_eval,
             "train_stats": self.agent.train_stats,
         }
-
-
-def create_and_train(
-    prices: pd.DataFrame, config: Config | None = None
-    ) -> tuple[PPOAgent, dict]:
-    """
-    Utility function to create all components and train
-
-    Args:
-        prices: DataFrame (n_days, n_stocks) of adjusted close prices.
-        config: Master configuration. Uses defaults if None.
-
-    Returns:
-        (trained_agent, training_results)
-    """
-    config = config or Config()
-
-    # Set seed
-    torch.manual_seed(config.training.seed)
-    np.random.seed(config.training.seed)
-
-    # Split data
-    n = len(prices)
-    train_end = int(n * 0.6)
-    val_end = int(n * 0.8)
-    warmup = config.features.normalize_window + 63
-
-    train_prices = prices.iloc[:train_end]
-    val_prices = prices.iloc[max(0, train_end - warmup) : val_end]
-
-    # Create environments
-    train_env = PortfolioEnv(train_prices, config.env, config.features)
-    val_env = PortfolioEnv(val_prices, config.env, config.features)
-
-    # Create agent
-    agent = PPOAgent(
-        n_stocks=prices.shape[1],
-        stock_feature_dim=train_env.stock_feature_dim,
-        market_feature_dim=train_env.market_feature_dim,
-        train_config=config.training,
-        net_config=config.network,
-        env_config=config.env,
-    )
-
-    param_count = sum(p.numel() for p in agent.ac.parameters())
-    print(f"  Model parameters: {param_count:,}")
-
-    # Train
-    training = Train(agent, train_env, val_env, config)
-    results = training.train()
-
-    return agent, results

@@ -38,7 +38,7 @@ class PortfolioEnv:
     def __init__(
         self,
         prices: pd.DataFrame,
-        target_returns: pd.DataFrame,
+        target_returns: pd.DataFrame | None = None,
         env_config: EnvironmentConfig | None = None,
         feature_config: FeatureConfig | None = None,
     ):
@@ -160,7 +160,7 @@ class PortfolioEnv:
         self._current_weights = new_weights.copy()
 
         # Simulate holding period and compute portfolio return
-        holding_return, holding_returns_daily = self._holding_period_returns()
+        holding_return, holding_returns_daily, period_returns = self._holding_period_returns()
 
         # Apply transaction costs to the first day's return
         net_return = holding_return - transaction_cost
@@ -201,8 +201,13 @@ class PortfolioEnv:
             self._current_weights = adjusted_weights.astype(np.float32)
 
         # Compute reward
+        if self.target_returns is not None:
+            target_return = self.target_returns.iloc[self._step_idx]
+        else:
+            target_return = np.mean(period_returns, axis=1).mean()  # Use realized return as target if not provided
+
         reward = self._compute_reward(
-            net_return, self.target_returns, holding_returns_daily, turnover
+            net_return, target_return, holding_returns_daily, turnover
         )
 
         # Build info dict
@@ -318,12 +323,12 @@ class PortfolioEnv:
 
         return rebalance_indices
 
-    def _holding_period_returns(self) -> tuple[float, np.ndarray]:
+    def _holding_period_returns(self) -> tuple[float, np.ndarray, pd.DataFrame]:
         """
         Simulate portfolio returns over the holding period.
 
         Returns:
-            (total_return, daily_returns_array)
+            (total_return, daily_returns_array, period_returns_df)
         """
         start = self._step_idx
         if self._rebalance_idx + 1 < len(self._rebalance_dates):
@@ -334,16 +339,16 @@ class PortfolioEnv:
         period_returns = self.returns.iloc[start + 1 : end + 1].values  # (days, stocks)
 
         if len(period_returns) == 0:
-            return 0.0, np.array([0.0])
+            return 0.0, np.array([0.0]), pd.DataFrame() 
 
         # Daily portfolio returns (constant weights during holding)
         daily_port_ret = period_returns @ self._current_weights
         total_return = np.prod(1 + daily_port_ret) - 1
 
-        return total_return, daily_port_ret
+        return total_return, daily_port_ret, period_returns
 
     def _compute_reward(
-        self, net_return: float, daily_returns: np.ndarray, turnover: float
+        self, net_return: float, target_return: float, daily_returns: np.ndarray, turnover: float
         ) -> float:
         """
         Compute reward based on configured reward type.
@@ -353,7 +358,7 @@ class PortfolioEnv:
         if reward_type == "mse":
             # MSE reward: penalize deviation from a target return 
             # (e.g., market or any benchmark return). 
-            target_return = self.target_returns.iloc[self._step_idx]
+            # target_return = self.target_returns.iloc[self._step_idx]
             reward = -((net_return - target_return) ** 2)
 
         elif reward_type == "sharpe" or reward_type == "combined":

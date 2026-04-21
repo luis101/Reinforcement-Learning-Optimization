@@ -19,9 +19,13 @@ from .environment import PortfolioEnv, MultiPeriodEnv
 from .features import FeatureConstructor
 from .networks import ActorCritic, ActorNetwork, CriticNetwork
 from .algo import PPOAgent
-from .training import Train, create_and_train
+from .universe import DynamicUniverse
+from .forwardbacktest import WalkForwardBacktestEngine
+from .training import Train
+from .fin_data import download_fin_data, get_sp500
 from .utils import (
     compute_portfolio_metrics,
+    generate_realistic_universe,
     evaluate_agent,
     format_metrics,
     plot_training_results,
@@ -40,9 +44,13 @@ __all__ = [
     "ActorNetwork",
     "CriticNetwork",
     "PPOAgent",
+    "DynamicUniverse",
+    "WalkForwardBacktestEngine",
     "Train",
-    "create_and_train",
+    "download_fin_data",
+    "get_sp500",
     "compute_portfolio_metrics",
+    "generate_realistic_universe",
     "evaluate_agent",
     "format_metrics",
     "plot_training_results",

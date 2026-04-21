@@ -8,125 +8,49 @@ your own DataFrame.
 import numpy as np
 import pandas as pd
 
+import os
+os.chdir("..")
 
-from .config import (
-    Config, 
-    EnvironmentConfig, FeatureConfig, 
-    NetworkConfig, TrainingConfig,
-)
-from .forwardbacktest import WalkForwardBacktestEngine
-from .universe import DynamicUniverse
-from .utils import (
+# from rl_agent.config import (
+#    Config, 
+#    EnvironmentConfig, FeatureConfig, 
+#    NetworkConfig, TrainingConfig, BacktestConfig
+# )
+from rl_agent.fin_data import download_fin_data, get_sp500
+from rl_agent.forwardbacktest import WalkForwardBacktestEngine
+from rl_agent.universe import DynamicUniverse
+from rl_agent.utils import (
     compute_portfolio_metrics,
     format_metrics,
+    generate_realistic_universe
 )
-
-###### Generate synthetic universe (replace with real data) ######
-
-def generate_realistic_universe(
-    n_years: int = 10,
-    n_initial_stocks: int = 80,
-    n_total_stocks: int = 100,
-    annual_ipo_rate: float = 0.05,
-    annual_delist_rate: float = 0.03,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """
-    Generate synthetic price data with IPOs and delistings.
-
-    Mimics a realistic stock universe where:
-    - ~80 stocks exist at the start
-    - ~5% of universe size IPO each year
-    - ~3% of universe size delist each year
-    - Delisted stocks may have negative terminal returns
-    """
-    rng = np.random.default_rng(seed)
-    n_days = n_years * 252
-    dates = pd.bdate_range(start="2015-01-02", periods=n_days, freq="B")
-    tickers = [f"STOCK_{i:03d}" for i in range(n_total_stocks)]
-
-    # Initialize all prices as NaN
-    prices = pd.DataFrame(
-        np.nan, index=dates, columns=tickers, dtype=np.float64
-    )
-
-    # Market factor
-    market_vol = 0.16 / np.sqrt(252)
-    market_returns = rng.normal(0.07 / 252, market_vol, n_days)
-
-    # Generate lifecycle events
-    stock_params = {}
-    active_set = set()
-
-    for i in range(n_total_stocks):
-        ticker = tickers[i]
-
-        # Initial stocks start on day 0
-        if i < n_initial_stocks:
-            ipo_day = 0
-        else:
-            # IPOs happen uniformly across the full period
-            ipo_day = rng.integers(252, n_days - 252)
-
-        # Some stocks delist
-        if rng.random() < annual_delist_rate * n_years / n_total_stocks:
-            # Delist at least 1 year after IPO, at least 1 year before end
-            earliest_delist = ipo_day + 252
-            if earliest_delist < n_days - 252:
-                delist_day = rng.integers(earliest_delist, n_days - 252)
-            else:
-                delist_day = None
-        else:
-            delist_day = None
-
-        beta = rng.uniform(0.5, 1.5)
-        alpha = rng.normal(0.0, 0.03 / 252)
-        idio_vol = rng.uniform(0.20, 0.50) / np.sqrt(252)
-
-        stock_params[ticker] = {
-            "ipo_day": ipo_day,
-            "delist_day": delist_day,
-            "beta": beta,
-            "alpha": alpha,
-            "idio_vol": idio_vol,
-        }
-
-    # Generate returns and prices
-    for ticker, params in stock_params.items():
-        ipo = params["ipo_day"]
-        delist = params["delist_day"]
-        end = delist if delist is not None else n_days
-
-        n_active = end - ipo
-        if n_active <= 0:
-            continue
-
-        returns = (
-            params["alpha"]
-            + params["beta"] * market_returns[ipo:end]
-            + rng.normal(0, params["idio_vol"], n_active)
-        )
-
-        # If delisting, add a negative terminal return
-        if delist is not None:
-            delist_loss = rng.uniform(-0.50, -0.10)
-            returns[-1] = delist_loss
-
-        stock_prices = 100 * np.cumprod(1 + returns)
-        prices.loc[dates[ipo:end], ticker] = stock_prices
-
-    return prices
 
 
 def main():
-    # Generate synthetic data with IPOs and delistings
-    prices = generate_realistic_universe(
-        n_years=27, n_initial_stocks=80, n_total_stocks=100
-    )
+    
+    # Obtain data for S&P 500 stocks (replace with your own data loading if needed)
+    
+    ticker, sp500 = get_sp500()
+    _, _, prices = download_fin_data(ticker=ticker, sp500=sp500)
+    #prices.index = prices.index.tz_localize(None)
 
-    # Show universe stats
-    universe = DynamicUniverse(prices)
-    print(universe.summary())
+    prices = pd.read_csv(, index_col=0, parse_dates=True)
+
+    # prices = daily_prices.pivot(index=prices.index, columns="Ticker", values="Price")
+    
+    # For demonstration, we use the synthetic universe generator. 
+    # Replace this with your actual price DataFrame.
+    # The DataFrame should have a DatetimeIndex and stock tickers as columns.
+    # Each cell contains the adjusted close price, with NaN for non-tradeable days.
+    # Generate synthetic data with IPOs and delistings
+    # prices = generate_realistic_universe(
+    #    n_years=11, n_initial_stocks=80, n_total_stocks=100
+    #)
+
+    print("\n" + "=" * 50)
+    print("  Sample Price Data")
+    print("=" * 50)
+    print(prices.head())
 
     # Run walk-forward optimization
     engine = WalkForwardBacktestEngine(prices)
@@ -137,21 +61,18 @@ def main():
     print("  Detailed Results")
     print("=" * 50)
 
-    # Monthly return statistics
-    oos = results["oos_series"]
-    print(f"\n  Monthly return distribution:")
-    print(f"    Mean:   {oos.mean():+.4f}")
-    print(f"    Median: {oos.median():+.4f}")
-    print(f"    Std:    {oos.std():.4f}")
-    print(f"    Skew:   {oos.skew():.3f}")
-    print(f"    Kurt:   {oos.kurtosis():.3f}")
-
     # Annual return breakdown
+    oos = results["oos_series"]
     if len(oos) > 12:
         annual = (1 + oos).groupby(oos.index.year).prod() - 1
         print(f"\n  Annual OOS returns:")
         for year, ret in annual.items():
             print(f"    {year}: {ret:+.2%}")
+
+    # Overall metrics
+    rl_values = results["oos_returns"]
+    rl_metrics = compute_portfolio_metrics(rl_values)
+    print(format_metrics(rl_metrics))
 
     # Weight concentration
     weight_df = engine.get_weight_history()
@@ -161,25 +82,71 @@ def main():
         ).mean()
         n_nonzero_avg = (weight_df.abs() > 0.001).sum(axis=1).mean()
         print(f"\n  Weight statistics:")
-        print(f"    Avg top-5 concentration: {top5_avg:.2%}")
-        print(f"    Avg non-zero positions:  {n_nonzero_avg:.0f}")
+        print(f"    Average top-5 concentration: {top5_avg:.2%}")
+        print(f"    Average non-zero positions:  {n_nonzero_avg:.0f}")
 
-    # ------------------------------------------------------------------
-    # 5. Compare to equal-weight benchmark
-    # ------------------------------------------------------------------
+    weight_df.to_csv()
+
+    weight_df.describe
+
+    # Compare to equal-weight benchmark
     print("\n  Equal-weight benchmark (same OOS periods):")
-    bm_returns = []
+    returns = prices.pct_change().fillna(0)
+    # bm_returns = []
+    period_returns = []
+    active_mask = pd.DataFrame()  
+    # for r in results["window_results"]:
+    #    period_ret = returns.loc[r.oos_start:r.oos_end]
+    #    active = r.active_mask[: prices.shape[1]]
+    #    ew_daily = period_ret.iloc[:, active].mean(axis=1)
+    #    bm_returns.append(np.prod(1 + ew_daily.values) - 1)
+    # for r in results["window_results"]:
+    #    start = prices.index.get_indexer([r.oos_start], method="ffill")[0]
+    #    end = prices.index.get_indexer([r.oos_end], method="ffill")[0]
+    #    period_ret = prices.iloc[start:end + 1].pct_change().fillna(0)
+    #    active = r.active_mask[: prices.shape[1]]
+    #    ew_daily = period_ret.iloc[:, active].mean(axis=1).values
+    #    bm_returns.append(np.prod(1 + ew_daily) - 1)
     for r in results["window_results"]:
-        start = prices.index.get_indexer([r.oos_start], method="ffill")[0]
-        end = prices.index.get_indexer([r.oos_end], method="ffill")[0]
-        period_ret = prices.iloc[start:end + 1].pct_change().fillna(0)
-        active = r.active_mask[: prices.shape[1]]
-        ew_daily = period_ret.iloc[:, active].mean(axis=1).values
-        bm_returns.append(np.prod(1 + ew_daily) - 1)
+        active_mask = pd.concat([active_mask, pd.DataFrame([r.active_mask])])
+        period_df = returns.loc[r.oos_start:r.oos_end]
+        period_returns.append((1 + period_df).prod() - 1)
 
-    bm_values = np.cumprod(np.concatenate([[1.0], 1 + np.array(bm_returns)]))
+    masked_returns = pd.DataFrame(period_returns).where(active_mask.values, np.nan)
+    bm_values = np.cumprod(np.concatenate([[1.0], 1 + np.array(masked_returns)]))
+    
     bm_metrics = compute_portfolio_metrics(bm_values)
     print(format_metrics(bm_metrics))
+
+    # Generate HTML dashboard
+
+    # Build a date index for the daily returns by concatenating OOS dates
+    daily_dates_list = []
+    for r in results["window_results"]:
+        oos_slice = prices.loc[r.oos_start:r.oos_end].index
+        daily_dates_list.append(oos_slice)
+    if daily_dates_list:
+        daily_dates = daily_dates_list[0].append(daily_dates_list[1:])
+    else:
+        daily_dates = pd.DatetimeIndex([])
+ 
+    dashboard_kwargs = dict(
+        rl_results=results["oos_returns"],
+        bm_daily_returns=bm_returns,
+        rl_dates=daily_dates,
+        weight_history=weight_df if len(weight_df) > 0 else None,
+        output_path="walkforward_dashboard.html",
+        title="RL Portfolio vs Equal-Weight Benchmark",
+    )
+ 
+    # Prefer Plotly (utils.py); fall back to Chart.js (utils_html.py)
+    try:
+        from rl_agent.utils import generate_dashboard
+        generate_dashboard(**dashboard_kwargs)
+    except ImportError:
+        from rl_agent.utils_html import generate_dashboard
+        print("  (Plotly not installed, using Chart.js fallback)")
+        generate_dashboard(**dashboard_kwargs)
 
 
 if __name__ == "__main__":

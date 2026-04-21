@@ -1,8 +1,8 @@
 """
-Dynamic stock universe  accounting for IPOs and delistings.
+Dynamic stock universe  accounting for entries and delistings.
 
-Manages a fixed-size tensor representation where stocks can enter (IPO)
-and exit (delist) over time. Uses masking to handle the variable universe
+Manages a fixed-size tensor representation where stocks can enter and
+exit (delist) over time. Uses masking to handle the variable universe
 while keeping network dimensions constant.
 """
 import numpy as np

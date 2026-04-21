@@ -18,12 +18,11 @@ import time
 import numpy as np
 import pandas as pd
 import datetime as dt
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import torch
+# import matplotlib.dates as mdates
+# import torch
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+# from typing import Literal
 
 from .config import Config, EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
 from .environment import PortfolioEnv
@@ -77,7 +76,8 @@ class WalkForwardBacktestEngine:
         self.feat_config = FeatureConfig()
         self.net_config = NetworkConfig()
         self.train_config = TrainingConfig()
-        self.prices = prices
+        # self.prices = prices
+        self.prices = self._get_clean_prices(prices)
 
         # Dynamic universe tracker
         self.universe = DynamicUniverse(
@@ -97,7 +97,7 @@ class WalkForwardBacktestEngine:
 
     def run(self) -> dict:
         """
-        Execute the full walk-forward optimization.
+        Execute the full optimization based on walk-forward strategy.
 
         Returns:
             Dictionary containing:
@@ -107,9 +107,9 @@ class WalkForwardBacktestEngine:
             - aggregate_metrics: overall performance metrics
         """
         print("=" * 50)
-        print("  Walk-Forward Portfolio Optimization")
+        print("Reinforcement Learning Portfolio Optimization")
         print("=" * 50)
-        print(self.universe.summary())
+        print(self.universe.summary)
         print(f"  Train window:     {self.wf_config.train_window_years} years")
         print(f"  Warm-start:       {self.wf_config.warmstart}")
         print(f"  Episodes/window:  {self.wf_config.episodes_per_window}")
@@ -118,12 +118,13 @@ class WalkForwardBacktestEngine:
         total_start = time.time()
 
         for i, window in enumerate(self._windows):
-            train_start_idx, train_end_idx, oos_start_idx, oos_end_idx = window
+            train_start_date, train_end_date, oos_start_date, oos_end_date = window
 
-            train_start_date = self.prices.index[train_start_idx]
-            train_end_date = self.prices.index[train_end_idx - 1]
-            oos_start_date = self.prices.index[oos_start_idx]
-            oos_end_date = self.prices.index[min(oos_end_idx - 1, len(self.prices) - 1)]
+            # train_start_idx, train_end_idx, oos_start_idx, oos_end_idx = window
+            # train_start_date = self.prices.index[train_start_idx]
+            # train_end_date = self.prices.index[train_end_idx - 1]
+            # oos_start_date = self.prices.index[oos_start_idx]
+            # oos_end_date = self.prices.index[min(oos_end_idx - 1, len(self.prices) - 1)]
 
             print(f"\n--- Window {i + 1}/{len(self._windows)} ---")
             print(f"  Train: {train_start_date} → {train_end_date}")
@@ -131,24 +132,23 @@ class WalkForwardBacktestEngine:
 
             # Get active universe for this window
             active_mask = np.zeros(self.prices.shape[1], dtype=bool)
-            active_mask[:self.prices.shape[1]] = ~self.prices.isna().iloc[oos_start_idx].values
+            active_mask[:self.prices.shape[1]] = ~self.prices.isna().loc[oos_start_date].values
 
             n_active = active_mask.sum()
             print(f"  Active stocks: {n_active}")
-
             if n_active < self.wf_config.min_active_stocks:
                 print(f"  Skip period: Only {n_active} active stocks (minimum: {self.wf_config.min_active_stocks})")
                 continue
             
             # Extract training data (handle NaN for missing data)
-            window_prices = self.prices.iloc[train_start_idx:train_end_idx].copy()
+            window_prices = self.prices.loc[train_start_date:train_end_date].copy()
             # Forward-fill then backward-fill such that we have no NaN for feature computation, 
             # but returns will be 0 for inactive periods (before listing/after delisting)
-            window_prices = window_prices.ffill().bfill()
+            # window_prices = window_prices.ffill().bfill()
             # If any column is entirely NaN, fill with a constant to avoid computation errors
-            for col in window_prices.columns:
-                if window_prices[col].isna().all():
-                    window_prices[col] = 100.0  # Placeholder, will be masked
+            # for col in window_prices.columns:
+            #    if window_prices[col].isna().all():
+            #        window_prices[col] = 100.0  # Placeholder, will be masked
             # window_prices.fillna(0.0, inplace=True) # Alternatively, fill with 0.0 
             # if we want features to reflect missing data more directly (e.g. 0 return before IPO)
 
@@ -158,7 +158,7 @@ class WalkForwardBacktestEngine:
             train_time = time.time() - window_start
 
             # Get deterministic action (weights) from trained agent
-            oos_weights, oos_return, oos_raw_return, oos_daily = self._apply_oos(agent, oos_start_idx, oos_end_idx, active_mask)
+            oos_weights, oos_return, oos_raw_return, oos_daily = self._apply_oos(agent, oos_start_date, oos_end_date, active_mask)
 
             # Store result
             result = WindowResult(
@@ -202,10 +202,28 @@ class WalkForwardBacktestEngine:
         print(f"Windows completed: {len(self.results)}/{len(self._windows)}")
 
         return summary
+    
+    # Get clean prices to account for lager outliers and data issues
+
+    def _get_clean_prices(self, prices: pd.DataFrame) -> pd.DataFrame:
+        # Get raw and winsorized returns
+        returns = prices.pct_change()
+        returns_win = returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1)
+        # returns_win = returns_win.clip(upper=3, lower=-0.5)
+        returns_mask = returns != returns_win
+        # prices = prices.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1)
+
+        # Get adjusted prices
+        adjusted_prices = self.prices.shift(1) * (1 + returns_win)
+        # Replace outliers
+        clean_prices = self.prices.copy()
+        clean_prices[returns_mask] = adjusted_prices[returns_mask]
+        
+        return clean_prices
 
     ###### Determine periods for training and OOS application ######
 
-    def _get_periods(self) -> list[tuple[int, int, int, int]]:
+    def _get_periods(self) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
         
         train_days = int(self.wf_config.train_window_years * 252)
         freq = self.env_config.rebalance_freq
@@ -213,17 +231,14 @@ class WalkForwardBacktestEngine:
 
         if freq == "weekly":
             # End of current week
-            period_ends = dates[dates.dt.isocalendar().week != dates.shift(-1).dt.isocalendar().week].tolist()
+            period_ends = dates[dates.dt.isocalendar().week != dates.shift(-1).dt.isocalendar().week]
         elif freq == "monthly":
             # End of current month
-            period_ends = dates[dates.dt.month != dates.shift(-1).dt.month].tolist()
+            period_ends = dates[dates.dt.month != dates.shift(-1).dt.month]
         else:
-            raise ValueError("freq must be 'weekly' or 'monthly'")
-        
-        # integer positions of period ends
-        period_ends = np.flatnonzero(period_ends.values)
+            raise ValueError(f"freq must be 'weekly' or 'monthly', got {freq!r}")
 
-        # Feature warmup requirement
+        # Feature warmup requirement. Minimum trading days needed for feature computation
         warmup = self.feat_config.normalize_window + max(
             max(self.feat_config.return_windows),
             self.feat_config.macd_slow + self.feat_config.macd_signal,
@@ -233,21 +248,38 @@ class WalkForwardBacktestEngine:
         step = self.wf_config.step_size # Roll forward by step periods (e.g. 1 month)
 
         # Train window
-        train_end_idx = period_ends + 1  # Exclusive end index for training
-        train_start_idx = np.max(0, train_end_idx - train_days)
+        train_end_date = period_ends # Exclusive end index for training
+        train_start_date = train_end_date - pd.offsets.BDay(n=train_days)
+
+        # Ensure training start is not before price data starts
+        train_start_date.loc[train_start_date < self.prices.index[0]] = self.prices.index[0]
 
         # Filter valid training windows
-        valid = (train_end_idx - train_start_idx) >= (warmup + 252) # At least 1 year of effective training data after warmup
+        valid = ((train_end_date - train_start_date) >= (
+            pd.Timedelta(days=(warmup + 252)*(365/252)))) # At least 1 year of effective training data after warmup
+        #         ) & (train_start_date >= self.prices.index[0]) # Training start must be within price data
 
-        train_start_idx = train_start_idx[valid]
-        train_end_idx = train_end_idx[valid]
+        train_start_date = train_start_date[valid]
+        train_end_date = train_end_date[valid]
         period_ends = period_ends[valid]
 
         # OOS windows
-        oos_start_idx = train_end_idx
-        oos_end_idx = period_ends[np.arange(len(train_end_idx)) + step] + 1  # Next period end after rolling forward by step
+        oos_start_date = train_end_date + pd.offsets.BDay(1)  # Next day available after training end
+        oos_start_idx = self.prices.index.get_indexer(oos_start_date, method='bfill') # Find the next available date in prices
+        oos_start_date = pd.Series(
+            np.where(oos_start_idx >= 0, self.prices.index[np.maximum(oos_start_idx, 0)], pd.NaT),
+            index=oos_start_date.index,
+        ) 
+        oos_end_date = period_ends.shift(-step)  # Next period end after rolling forward by step
 
-        return list(zip(train_start_idx, train_end_idx, oos_start_idx, oos_end_idx))
+        # Filter valid OOS windows        
+        valid_oos = oos_end_date.notna() & (oos_end_date <= self.prices.index[-1])  # OOS end must be within price data
+        train_start_date = train_start_date[valid_oos]
+        train_end_date = train_end_date[valid_oos]
+        oos_start_date = oos_start_date[valid_oos]
+        oos_end_date = oos_end_date[valid_oos]
+
+        return list(zip(train_start_date, train_end_date, oos_start_date, oos_end_date))
 
     ###### Training ######
 
@@ -273,7 +305,8 @@ class WalkForwardBacktestEngine:
         train_config.eval_frequency = max(1, self.wf_config.episodes_per_window // 5)
         train_config.save_frequency = self.wf_config.episodes_per_window + 1  # Don't save
 
-        train_env = PortfolioEnv(train_prices, env_config, feature_config)
+        train_env = PortfolioEnv(train_prices, target_returns=self.env_config.target_returns, 
+                                 env_config=env_config, feature_config=feature_config)
 
         # Create or warm-start agent
         if self.wf_config.warmstart and self._current_agent is not None:
@@ -363,7 +396,7 @@ class WalkForwardBacktestEngine:
     ###### Out-of-sample application ######
 
     def _apply_oos(self,
-        agent: PPOAgent, oos_start_idx: int, oos_end_idx: int, active_mask: np.ndarray,
+        agent: PPOAgent, oos_start_date: int, oos_end_date: int, active_mask: np.ndarray,
         ) -> tuple[np.ndarray, float, np.ndarray]:
         """
         Apply the trained agent's weights to the out-of-sample period.
@@ -375,10 +408,10 @@ class WalkForwardBacktestEngine:
             (weights, total_return, daily_returns)
         """
         # Build the state at the OOS start date using full price history
-        # We need features computed up to oos_start, so use a lookback
+        # We need features computed up to oos_start, so use a lookback window that covers all feature requirements
         lookback = self.feat_config.normalize_window + 100
-        feature_start = max(0, oos_start_idx - lookback)
-        feature_prices = self.prices.iloc[feature_start:oos_end_idx].copy()
+        feature_start = max(self.prices.index[0], oos_start_date - pd.Timedelta(days=lookback))
+        feature_prices = self.prices.loc[feature_start:oos_end_date].copy()
         
         feature_prices = feature_prices.ffill().bfill()
         for col in feature_prices.columns:
@@ -393,8 +426,12 @@ class WalkForwardBacktestEngine:
         feat_engine = FeatureConstructor(feature_prices, feat_config)
 
         # Get state at the OOS start (relative to feature_prices)
-        relative_oos_start = oos_start_idx - feature_start
-        stock_feats = feat_engine.get_stock_features(relative_oos_start)
+        # relative_oos_start = oos_start_date - (oos_start_date - feature_start)
+        # relative_oos_start_idx = self.prices.index.get_indexer([relative_oos_start], method='ffill')[0]
+        relative_oos_start_idx = feature_prices.index.get_indexer([oos_start_date], method='ffill')[0]
+        print(f"OOS start index: {relative_oos_start_idx}", f"OOS start date: {oos_start_date}")
+        # stock_feats = feat_engine.get_stock_features(relative_oos_start)
+        stock_feats = feat_engine.get_stock_features(relative_oos_start_idx)
 
         # Add dummy current weights (equal weight for active stocks) 
         # Why not last window's weights? Because the agent should learn to produce valid weights 
@@ -406,7 +443,8 @@ class WalkForwardBacktestEngine:
             current_weights[active_mask[:n_stocks]] = 1.0 / n_active
 
         stock_feats = np.hstack([stock_feats, current_weights.reshape(-1, 1)])
-        market_feats = feat_engine.get_market_features(relative_oos_start)
+        # market_feats = feat_engine.get_market_features(relative_oos_start)
+        market_feats = feat_engine.get_market_features(relative_oos_start_idx)
 
         # Get deterministic action
         action, _, _ = agent.select_action(
@@ -417,8 +455,9 @@ class WalkForwardBacktestEngine:
         weights = self._obtain_oos_weights(action, active_mask[:n_stocks])
 
         # Simulate OOS returns
-        oos_returns = self.prices.iloc[oos_start_idx:oos_end_idx].pct_change().fillna(0)
-        daily_port_ret = (oos_returns.values @ weights[:n_stocks]).astype(np.float64)
+        # oos_returns = self.prices.loc[oos_start_date:oos_end_date].pct_change().fillna(0)
+        oos_returns = self.prices.loc[oos_start_date:oos_end_date].pct_change()
+        daily_port_ret = (oos_returns.fillna(0.0).values @ weights[:n_stocks]).astype(np.float64)
 
         # Apply transaction costs (assume rebalancing from previous weights)
         tc_rate = (self.env_config.transaction_cost_bps + self.env_config.slippage_bps) / 10_000

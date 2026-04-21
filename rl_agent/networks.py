@@ -10,8 +10,8 @@ Neural network architectures for the Actor-Critic agent
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Literal
+# import numpy as np
+# from typing import Literal
 
 from .config import NetworkConfig, EnvironmentConfig
 
@@ -77,12 +77,10 @@ class MLP(nn.Module):
     Used for both actor and critic heads after attention processing.
     """
 
-    def __init__(
-        self,
+    def __init__(self,
         input_dim: int, hidden_dims: list[int], output_dim: int,
         activation: str = "gelu", dropout: float = 0.1,
-        use_layer_norm: bool = True,
-        output_activation: nn.Module | None = None
+        use_layer_norm: bool = True, output_activation: nn.Module | None = None
         ):
         super().__init__()
 
