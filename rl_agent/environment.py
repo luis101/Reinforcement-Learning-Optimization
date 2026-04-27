@@ -38,6 +38,7 @@ class PortfolioEnv:
     def __init__(
         self,
         prices: pd.DataFrame,
+        returns: pd.DataFrame | None = None,
         target_returns: pd.DataFrame | None = None,
         env_config: EnvironmentConfig | None = None,
         feature_config: FeatureConfig | None = None,
@@ -45,19 +46,25 @@ class PortfolioEnv:
         """
         Args:
             prices: DataFrame (n_days, n_stocks) of adjusted close prices.
-            target_return: Target return series for reward calculation.
+            target_returns: Target return series for reward calculation.
             env_config: Environment configuration.
             feature_config: Feature engineering configuration.
+            returns: Pre-computed returns aligned with prices. If provided, skips pct_change
+                     and winsorization. Should already be cleaned (winsorized, fillna(0)).
         """
         self.config = env_config or EnvironmentConfig()
         self.prices = prices
-        self.returns = prices.pct_change().fillna(0)
+        if returns is not None:
+            self.returns = returns.fillna(0)
+        else:
+            self.returns = prices.pct_change()
+            self.returns = self.returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1).fillna(0)
         self.n_stocks = prices.shape[1]
         self.n_days = prices.shape[0]
         self.target_returns = target_returns
 
-        # Feature engine
-        self.feature_engine = FeatureConstructor(prices, feature_config)
+        # Feature engine — pass returns to avoid recomputing pct_change
+        self.feature_engine = FeatureConstructor(prices, feature_config, returns=self.returns)
 
         # Compute rebalancing schedule
         self._rebalance_dates = self._build_rebalance_schedule()
@@ -304,9 +311,6 @@ class PortfolioEnv:
                     rebalance_indices.append(i)
                 elif i == len(dates) - 1:
                     rebalance_indices.append(i)
-            # Also include start as first rebalance point
-            if not rebalance_indices or rebalance_indices[0] != start_idx:
-                rebalance_indices.insert(0, start_idx)
 
         elif self.config.rebalance_freq == "weekly":
             # Rebalance on Fridays (or last trading day of the week)
@@ -316,10 +320,12 @@ class PortfolioEnv:
                         rebalance_indices.append(i)
                 elif i == len(dates) - 1:
                     rebalance_indices.append(i)
-            if not rebalance_indices or rebalance_indices[0] != start_idx:
-                rebalance_indices.insert(0, start_idx)
         else:
             raise ValueError(f"Unknown rebalance frequency: {self.config.rebalance_freq}")
+
+        # Ensure the first valid date is always a rebalance point
+        if not rebalance_indices or rebalance_indices[0] != start_idx:
+            rebalance_indices.insert(0, start_idx)
 
         return rebalance_indices
 
@@ -421,15 +427,13 @@ class MultiPeriodEnv:
         warmup = (feature_config or FeatureConfig()).normalize_window + 63
 
         self.train_env = PortfolioEnv(
-            prices.iloc[:train_end], env_config, feature_config
+            prices.iloc[:train_end], env_config=env_config, feature_config=feature_config
         )
         self.val_env = PortfolioEnv(
             prices.iloc[max(0, train_end - warmup) : val_end],
-            env_config,
-            feature_config,
+            env_config=env_config, feature_config=feature_config,
         )
         self.test_env = PortfolioEnv(
             prices.iloc[max(0, val_end - warmup) :],
-            env_config,
-            feature_config,
+            env_config=env_config, feature_config=feature_config,
         )

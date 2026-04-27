@@ -15,17 +15,20 @@ from .config import FeatureConfig
 class FeatureConstructor:
     """Computes and caches features from price data."""
 
-    def __init__(self, prices: pd.DataFrame, config: FeatureConfig | None = None):
+    def __init__(self, prices: pd.DataFrame, config: FeatureConfig | None = None,
+                 returns: pd.DataFrame | None = None):
         """
         Args:
             prices: DataFrame with DatetimeIndex rows (days) and stock and/or asset columns.
                     Values are adjusted close prices.
             config: Feature configuration. Uses defaults if None.
+            returns: Pre-computed returns aligned with prices. If provided, skips pct_change.
+                     Price-level features (MACD, Bollinger) still use prices.
         """
         self.config = config or FeatureConfig()
         self.prices = prices
         self.n_stocks = prices.shape[1]
-        self.returns = prices.pct_change()
+        self.returns = returns if returns is not None else prices.pct_change()
 
         # Pre-compute all features (stored as DataFrames aligned to prices index)
         self._features: dict[str, pd.DataFrame] = {}

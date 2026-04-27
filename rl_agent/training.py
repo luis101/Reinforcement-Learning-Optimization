@@ -125,7 +125,7 @@ class Train:
             if episode % self.tc.eval_frequency == 0:
                 # Evaluate on validation set and log results
                 if self.val_env is None:
-                    return
+                    continue
 
                 result = evaluate_agent(self.agent, self.val_env)
                 metrics = result["metrics"]

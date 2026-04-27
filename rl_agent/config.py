@@ -129,6 +129,7 @@ class TrainingConfig:
     entropy_coeff: float = 0.01  # Entropy bonus for exploration
     value_loss_coeff: float = 0.5  # Value loss weight
     max_grad_norm: float = 0.5  # Gradient clipping
+    kl_target: float = 0.03  # Max KL divergence per update epoch before early stopping
 
     # Training schedule
     n_episodes: int = 1000

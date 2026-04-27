@@ -309,9 +309,12 @@ class PPOAgent:
                 for k, v in stats.items():
                     all_stats[k].append(v)
 
-            # Early stopping if KL divergence too large
-            mean_kl = np.mean(all_stats["approx_kl"][-len(self.buffer) :])
-            if mean_kl > 0.03:  # Target KL threshold
+            # KL divergence measures how much the updated policy has shifted from
+            # the policy that collected the rollout data. Too large a shift means
+            # the PPO importance-weight correction is no longer reliable, so we
+            # stop updating early to keep the old and new policies close together.
+            mean_kl = np.mean(all_stats["approx_kl"][-len(self.buffer):])
+            if mean_kl > self.config.kl_target:
                 break
 
         # Step LR schedulers

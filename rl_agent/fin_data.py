@@ -64,7 +64,7 @@ def download_fin_data(ticker, start_date = "2005-01-01", month_end=True, end_dat
         try:
             stock_data = yf.download(stock_symbol, start=start_date, end=end_date)
             if stock_data.index.tz is not None:
-                stock_data.index = stock_data.index.tz_localize(None)
+                stock_data.index = stock_data.index.tz_convert(None)
             stock_data = stock_data.stack(1)
             stock_data = stock_data.reset_index(level=1)
             
@@ -90,7 +90,7 @@ def download_fin_data(ticker, start_date = "2005-01-01", month_end=True, end_dat
             continue
 
         if data.index.tz is not None:
-            data.index = data.index.tz_localize(None)
+            data.index = data.index.tz_convert(None)
 
         data['Ticker'] = stock_symbol
 

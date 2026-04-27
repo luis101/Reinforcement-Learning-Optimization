@@ -5,11 +5,15 @@ Demonstrates the rolling-window strategy on synthetic 27-year data
 with IPOs and delistings. Replace the synthetic data section with
 your own DataFrame.
 """
+import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import os
-os.chdir("..")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# import os
+# os.chdir("..")
 
 # from rl_agent.config import (
 #    Config, 
@@ -18,23 +22,25 @@ os.chdir("..")
 # )
 from rl_agent.fin_data import download_fin_data, get_sp500
 from rl_agent.forwardbacktest import WalkForwardBacktestEngine
-from rl_agent.universe import DynamicUniverse
 from rl_agent.utils import (
     compute_portfolio_metrics,
     format_metrics,
     generate_realistic_universe
 )
 
+ticker, sp500 = get_sp500()
+prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
+engine = WalkForwardBacktestEngine(prices)
 
 def main():
     
     # Obtain data for S&P 500 stocks (replace with your own data loading if needed)
     
     ticker, sp500 = get_sp500()
-    _, _, prices = download_fin_data(ticker=ticker, sp500=sp500)
+    # _, _, prices = download_fin_data(ticker=ticker, sp500=sp500)
     #prices.index = prices.index.tz_localize(None)
 
-    prices = pd.read_csv(, index_col=0, parse_dates=True)
+    prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
 
     # prices = daily_prices.pivot(index=prices.index, columns="Ticker", values="Price")
     
@@ -46,11 +52,6 @@ def main():
     # prices = generate_realistic_universe(
     #    n_years=11, n_initial_stocks=80, n_total_stocks=100
     #)
-
-    print("\n" + "=" * 50)
-    print("  Sample Price Data")
-    print("=" * 50)
-    print(prices.head())
 
     # Run walk-forward optimization
     engine = WalkForwardBacktestEngine(prices)
@@ -70,8 +71,10 @@ def main():
             print(f"    {year}: {ret:+.2%}")
 
     # Overall metrics
-    rl_values = results["oos_returns"]
-    rl_metrics = compute_portfolio_metrics(rl_values)
+    rl_returns = results["oos_returns"]
+    rl_values = np.cumprod(np.concatenate([[1.0], 1 + rl_returns]))
+    # pd.DataFrame(rl_values).to_csv("C:\\Users\\lukas\\Downloads\\rl_portfolio_values.csv")
+    rl_metrics = compute_portfolio_metrics(rl_values, rl_returns, periods_per_year=12)
     print(format_metrics(rl_metrics))
 
     # Weight concentration
@@ -85,13 +88,15 @@ def main():
         print(f"    Average top-5 concentration: {top5_avg:.2%}")
         print(f"    Average non-zero positions:  {n_nonzero_avg:.0f}")
 
-    weight_df.to_csv()
-
-    weight_df.describe
+    weight_df.to_csv("C:\\Users\\lukas\\Downloads\\weights_rl.csv")
 
     # Compare to equal-weight benchmark
     print("\n  Equal-weight benchmark (same OOS periods):")
-    returns = prices.pct_change().fillna(0)
+    # returns = engine.prices.pct_change().fillna(0)
+    bm_prices = engine.prices.mask(engine.prices < 1)
+    returns = bm_prices.pct_change()
+    returns = returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1).fillna(0)
+    
     # bm_returns = []
     period_returns = []
     active_mask = pd.DataFrame()  
@@ -113,30 +118,50 @@ def main():
         period_returns.append((1 + period_df).prod() - 1)
 
     masked_returns = pd.DataFrame(period_returns).where(active_mask.values, np.nan)
-    bm_values = np.cumprod(np.concatenate([[1.0], 1 + np.array(masked_returns)]))
-    
-    bm_metrics = compute_portfolio_metrics(bm_values)
+    bm_returns = masked_returns.mean(axis=1).fillna(0).values
+
+    # Compute equal-weight TC: each period weights drift with returns,
+    # and must be rebalanced back to equal weight at the next period start.
+    tc_rate_bm = (engine.env_config.transaction_cost_bps + engine.env_config.slippage_bps) / 10_000
+    bm_tc_per_period = []
+    prev_ew_end = None
+    for r in results["window_results"]:
+        active = r.active_mask[:prices.shape[1]]
+        n_active = int(active.sum())
+        if n_active == 0:
+            bm_tc_per_period.append(0.0)
+            continue
+        ew = np.zeros(prices.shape[1])
+        ew[active] = 1.0 / n_active
+        turnover = np.sum(np.abs(ew - prev_ew_end)) if prev_ew_end is not None else ew.sum()
+        bm_tc_per_period.append(turnover * tc_rate_bm)
+        cum = (1 + returns.loc[r.oos_start:r.oos_end]).prod().values[:len(ew)]
+        end_w = ew * cum
+        s = end_w.sum()
+        prev_ew_end = end_w / s if s > 1e-10 else ew.copy()
+    bm_net_rets = bm_returns - np.array(bm_tc_per_period)
+
+    bm_values = np.cumprod(np.concatenate([[1.0], 1 + bm_returns]))
+    pd.DataFrame(bm_values).to_csv("C:\\Users\\lukas\\Downloads\\bm_portfolio_values.csv")
+        
+    bm_metrics = compute_portfolio_metrics(bm_values, bm_returns, periods_per_year=12)
     print(format_metrics(bm_metrics))
 
     # Generate HTML dashboard
 
-    # Build a date index for the daily returns by concatenating OOS dates
-    daily_dates_list = []
-    for r in results["window_results"]:
-        oos_slice = prices.loc[r.oos_start:r.oos_end].index
-        daily_dates_list.append(oos_slice)
-    if daily_dates_list:
-        daily_dates = daily_dates_list[0].append(daily_dates_list[1:])
-    else:
-        daily_dates = pd.DatetimeIndex([])
- 
+    # One date per OOS period (monthly data → one date per bar/point)
+    oos_dates = pd.DatetimeIndex([r.oos_start for r in results["window_results"]])
+
     dashboard_kwargs = dict(
         rl_results=results["oos_returns"],
         bm_daily_returns=bm_returns,
-        rl_dates=daily_dates,
+        rl_dates=oos_dates,
         weight_history=weight_df if len(weight_df) > 0 else None,
-        output_path="walkforward_dashboard.html",
+        output_path="rl_backtest_dashboard.html",
         title="RL Portfolio vs Equal-Weight Benchmark",
+        periods_per_year=12,
+        rl_gross_returns=results["oos_raw_returns"],
+        bm_net_returns=bm_net_rets,
     )
  
     # Prefer Plotly (utils.py); fall back to Chart.js (utils_html.py)

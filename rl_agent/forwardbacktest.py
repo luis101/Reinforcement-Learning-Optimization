@@ -24,11 +24,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 # from typing import Literal
 
-from .config import Config, EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
+from .config import EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
 from .environment import PortfolioEnv
 from .algo import PPOAgent, Transition
 from .features import FeatureConstructor
-from .training import Train
 from .universe import DynamicUniverse
 from .utils import compute_portfolio_metrics, format_metrics
 
@@ -65,19 +64,24 @@ class WalkForwardBacktestEngine:
     - Comprehensive result aggregation
     """
 
-    def __init__(self, prices: pd.DataFrame, wf_config: BacktestConfig | None = None):
+    def __init__(self, prices: pd.DataFrame, returns: pd.DataFrame | None = None,
+                 wf_config: BacktestConfig | None = None):
         """
         Args:
-            prices: Full price DataFrame. NaN for dates before first listing or after delisting. 
-            DatetimeIndex required. Columns are stock identifiers.
+            prices: Full price DataFrame. NaN for dates before first listing or after delisting.
+                    DatetimeIndex required. Columns are stock identifiers.
+            returns: Pre-computed returns with the same shape, index, and columns as prices.
+                     If provided, used directly wherever returns are needed instead of
+                     recomputing pct_change. Price-level features (MACD, Bollinger) still
+                     use clean_prices. If not provided, returns are derived from clean_prices.
         """
         self.wf_config = wf_config or BacktestConfig()
         self.env_config = EnvironmentConfig()
         self.feat_config = FeatureConfig()
         self.net_config = NetworkConfig()
         self.train_config = TrainingConfig()
-        # self.prices = prices
         self.prices = self._get_clean_prices(prices)
+        self.returns = self._get_clean_returns(prices, returns)
 
         # Dynamic universe tracker
         self.universe = DynamicUniverse(
@@ -142,6 +146,7 @@ class WalkForwardBacktestEngine:
             
             # Extract training data (handle NaN for missing data)
             window_prices = self.prices.loc[train_start_date:train_end_date].copy()
+            window_returns = self.returns.loc[train_start_date:train_end_date].copy()
             # Forward-fill then backward-fill such that we have no NaN for feature computation, 
             # but returns will be 0 for inactive periods (before listing/after delisting)
             # window_prices = window_prices.ffill().bfill()
@@ -154,7 +159,7 @@ class WalkForwardBacktestEngine:
 
             # Train the agent on this window
             window_start = time.time()
-            agent, train_info = self._train_window(window_prices, active_mask, i)
+            agent, train_info = self._train_window(window_prices, window_returns, active_mask, i)
             train_time = time.time() - window_start
 
             # Get deterministic action (weights) from trained agent
@@ -203,23 +208,69 @@ class WalkForwardBacktestEngine:
 
         return summary
     
-    # Get clean prices to account for lager outliers and data issues
+    def _get_clean_returns(self, prices: pd.DataFrame,
+                           ext_returns: pd.DataFrame | None = None) -> pd.DataFrame:
+        """
+        If returns are provided they are used directly (assuming they are pre-aligned and cleaned),
+        Otherwise returns are derived from clean_prices with row-wise winsorization.
+        """
 
+        if ext_returns is not None:
+            penny_mask = prices.isna()
+            return ext_returns.where(~penny_mask)
+        else:
+            # Replace penny stocks with prices lower 1 with NaN in the prices DataFrame
+            prices = prices.mask(prices < 1)
+            returns = prices.pct_change()
+        return returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1)
+    
     def _get_clean_prices(self, prices: pd.DataFrame) -> pd.DataFrame:
+        """
+        Get clean prices to account for larger outliers and data issues.
+        """
+        
+        # Replace penny stocks with prices lower 1 with NaN in the prices DataFrame
+        prices = prices.mask(prices < 1)
+
         # Get raw and winsorized returns
         returns = prices.pct_change()
         returns_win = returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1)
         # returns_win = returns_win.clip(upper=3, lower=-0.5)
         returns_mask = returns != returns_win
-        # prices = prices.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1)
+
+        # For each consecutive run of non-NaN prices, reconstruct prices from the
+        # first (anchor) price and winsorized returns, replacing outlier-affected days.        
 
         # Get adjusted prices
-        adjusted_prices = self.prices.shift(1) * (1 + returns_win)
+        adjusted_prices = []
+        first_prices = prices[prices.shift(1).isnull()] # Keep price only if first observation 
+
+        # first_prices = prices.where(prices.shift(1).isna())
+        # group_ids = first_prices.notna().cumsum()
+        # adj_rets = returns_win.mask(first_prices.notna(), 0)
+
+        # cum_growth = adj_rets.apply(lambda col: (1 + col).groupby(group_ids[col.name]).cumprod())
+        # anchor_prices = first_prices.apply(lambda col: col.groupby(group_ids[col.name]).transform("first"))
+        # adjusted_prices = anchor_prices * cum_growth
+
+        for col in first_prices.columns:
+            group_id = first_prices[col].notna().cumsum()
+            adj_rets = returns_win[col].mask(first_prices[col].notna(), 0)
+
+            # Calculate cumulative growth for each group of consecutive non-NaN values
+            cum_growth = (1 + adj_rets).groupby(group_id).cumprod() 
+            adj_prices = first_prices[col].groupby(group_id).transform('first')
+
+            adjusted_prices.append((adj_prices * cum_growth).rename(col))
+
+        adjusted_prices = pd.concat(adjusted_prices, axis=1)
+
         # Replace outliers
-        clean_prices = self.prices.copy()
+        clean_prices = prices.copy()
         clean_prices[returns_mask] = adjusted_prices[returns_mask]
         
         return clean_prices
+
 
     ###### Determine periods for training and OOS application ######
 
@@ -284,7 +335,8 @@ class WalkForwardBacktestEngine:
     ###### Training ######
 
     def _train_window(self,
-        train_prices: pd.DataFrame, active_mask: np.ndarray, window_idx: int,
+        train_prices: pd.DataFrame, train_returns: pd.DataFrame,
+        active_mask: np.ndarray, window_idx: int,
         ) -> tuple[PPOAgent, dict]:
         """
         Train (or warm-start) an agent on one window of data.
@@ -305,8 +357,10 @@ class WalkForwardBacktestEngine:
         train_config.eval_frequency = max(1, self.wf_config.episodes_per_window // 5)
         train_config.save_frequency = self.wf_config.episodes_per_window + 1  # Don't save
 
-        train_env = PortfolioEnv(train_prices, target_returns=self.env_config.target_returns, 
-                                 env_config=env_config, feature_config=feature_config)
+        train_env = PortfolioEnv(train_prices, returns=train_returns,
+                                 target_returns=self.env_config.target_returns,
+                                 env_config=env_config, feature_config=feature_config,
+                                 )
 
         # Create or warm-start agent
         if self.wf_config.warmstart and self._current_agent is not None:
@@ -429,8 +483,6 @@ class WalkForwardBacktestEngine:
         # relative_oos_start = oos_start_date - (oos_start_date - feature_start)
         # relative_oos_start_idx = self.prices.index.get_indexer([relative_oos_start], method='ffill')[0]
         relative_oos_start_idx = feature_prices.index.get_indexer([oos_start_date], method='ffill')[0]
-        print(f"OOS start index: {relative_oos_start_idx}", f"OOS start date: {oos_start_date}")
-        # stock_feats = feat_engine.get_stock_features(relative_oos_start)
         stock_feats = feat_engine.get_stock_features(relative_oos_start_idx)
 
         # Add dummy current weights (equal weight for active stocks) 
@@ -454,10 +506,9 @@ class WalkForwardBacktestEngine:
         # Apply universe mask
         weights = self._obtain_oos_weights(action, active_mask[:n_stocks])
 
-        # Simulate OOS returns
-        # oos_returns = self.prices.loc[oos_start_date:oos_end_date].pct_change().fillna(0)
-        oos_returns = self.prices.loc[oos_start_date:oos_end_date].pct_change()
-        daily_port_ret = (oos_returns.fillna(0.0).values @ weights[:n_stocks]).astype(np.float64)
+        # Simulate OOS returns — use pre-computed clean_returns (already winsorized and with NaN for missing data)
+        oos_returns = self.returns.loc[oos_start_date:oos_end_date].fillna(0) 
+        daily_port_ret = (oos_returns.values @ weights[:n_stocks]).astype(np.float64)
 
         # Apply transaction costs (assume rebalancing from previous weights)
         tc_rate = (self.env_config.transaction_cost_bps + self.env_config.slippage_bps) / 10_000
