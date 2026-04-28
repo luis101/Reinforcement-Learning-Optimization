@@ -120,6 +120,7 @@ class WalkForwardBacktestEngine:
         print("=" * 50)
 
         total_start = time.time()
+        prev_end_weights: np.ndarray | None = None  # Drifted weights from the previous OOS period
 
         for i, window in enumerate(self._windows):
             train_start_date, train_end_date, oos_start_date, oos_end_date = window
@@ -163,7 +164,17 @@ class WalkForwardBacktestEngine:
             train_time = time.time() - window_start
 
             # Get deterministic action (weights) from trained agent
-            oos_weights, oos_return, oos_raw_return, oos_daily = self._apply_oos(agent, oos_start_date, oos_end_date, active_mask)
+            oos_weights, oos_return, oos_raw_return, oos_daily = self._apply_oos(
+                agent, oos_start_date, oos_end_date, active_mask, prev_end_weights
+            )
+
+            # Compute drifted end-of-OOS weights to use as the next window's initial state
+            oos_ret_slice = self.returns.loc[oos_start_date:oos_end_date].fillna(0)
+            cum = (1 + oos_ret_slice).prod().values
+            n = min(len(oos_weights), len(cum))
+            end_w = oos_weights[:n] * cum[:n]
+            s = end_w.sum()
+            prev_end_weights = end_w / s if s > 1e-10 else oos_weights[:n].copy()
 
             # Store result
             result = WindowResult(
@@ -382,8 +393,9 @@ class WalkForwardBacktestEngine:
                 env_config=env_config,
             )
 
-        # Training loop with early stopping
+        # Training loop with early stopping and best-checkpoint tracking
         best_reward = -np.inf
+        best_state_dict = None
         patience_counter = 0
         episode_rewards = []
 
@@ -424,17 +436,22 @@ class WalkForwardBacktestEngine:
             agent.update()
             episode_rewards.append(total_reward)
 
-            # Early stopping check (on rolling average)
+            # Early stopping check (on rolling average); snapshot best weights
             if ep >= self.wf_config.min_episodes:
                 recent_avg = np.mean(episode_rewards[-20:])
                 if recent_avg > best_reward + 0.001:
                     best_reward = recent_avg
+                    best_state_dict = copy.deepcopy(agent.ac.state_dict())
                     patience_counter = 0
                 else:
                     patience_counter += 1
 
                 if patience_counter >= self.wf_config.patience:
                     break
+
+        # Restore the best-performing weights for OOS application
+        if best_state_dict is not None:
+            agent.ac.load_state_dict(best_state_dict)
 
         # Store agent for next window's warm-start
         self._current_agent = agent
@@ -451,6 +468,7 @@ class WalkForwardBacktestEngine:
 
     def _apply_oos(self,
         agent: PPOAgent, oos_start_date: int, oos_end_date: int, active_mask: np.ndarray,
+        prev_end_weights: np.ndarray | None = None,
         ) -> tuple[np.ndarray, float, np.ndarray]:
         """
         Apply the trained agent's weights to the out-of-sample period.
@@ -485,14 +503,23 @@ class WalkForwardBacktestEngine:
         relative_oos_start_idx = feature_prices.index.get_indexer([oos_start_date], method='ffill')[0]
         stock_feats = feat_engine.get_stock_features(relative_oos_start_idx)
 
-        # Add dummy current weights (equal weight for active stocks) 
-        # Why not last window's weights? Because the agent should learn to produce valid weights 
-        # even from a naive starting point, and we want to avoid leaking information.
+        # Initial weights: use drifted end-of-previous-period weights so the agent
+        # sees a realistic pre-rebalance state. Fall back to equal weight on the first window.
         n_stocks = feature_prices.shape[1]
-        current_weights = np.zeros(n_stocks, dtype=np.float32)
         n_active = active_mask[:n_stocks].sum()
-        if n_active > 0:
-            current_weights[active_mask[:n_stocks]] = 1.0 / n_active
+        if prev_end_weights is not None and len(prev_end_weights) >= n_stocks:
+            current_weights = prev_end_weights[:n_stocks].copy().astype(np.float32)
+            current_weights[~active_mask[:n_stocks]] = 0.0  # zero out newly delisted stocks
+            s = current_weights.sum()
+            if s > 1e-10:
+                current_weights /= s
+            elif n_active > 0:
+                current_weights = np.zeros(n_stocks, dtype=np.float32)
+                current_weights[active_mask[:n_stocks]] = 1.0 / n_active
+        else:
+            current_weights = np.zeros(n_stocks, dtype=np.float32)
+            if n_active > 0:
+                current_weights[active_mask[:n_stocks]] = 1.0 / n_active
 
         stock_feats = np.hstack([stock_feats, current_weights.reshape(-1, 1)])
         # market_feats = feat_engine.get_market_features(relative_oos_start)

@@ -75,6 +75,7 @@ class PortfolioEnv:
         self._rebalance_idx: int = 0
         self._portfolio_values: list[float] = []
         self._trade_history: list[dict] = []
+        self._all_daily_returns: list[np.ndarray] = []
 
     # Gym-like interface
 
@@ -96,6 +97,7 @@ class PortfolioEnv:
             self._current_weights[:] = 0.0
         self._portfolio_values = [1.0]  # Start with unit value
         self._trade_history = []
+        self._all_daily_returns = []
 
         return self._get_state()
 
@@ -168,6 +170,7 @@ class PortfolioEnv:
 
         # Simulate holding period and compute portfolio return
         holding_return, holding_returns_daily, period_returns = self._holding_period_returns()
+        self._all_daily_returns.append(holding_returns_daily)
 
         # Apply transaction costs to the first day's return
         net_return = holding_return - transaction_cost
@@ -361,31 +364,33 @@ class PortfolioEnv:
         """
         reward_type = self.config.reward_type
 
-        if reward_type == "mse":
-            # MSE reward: penalize deviation from a target return 
-            # (e.g., market or any benchmark return). 
-            # target_return = self.target_returns.iloc[self._step_idx]
+        if reward_type == "return":
+            # Log return reward: simple, unbiased, and stable.
+            reward = float(np.log1p(net_return))
+
+        elif reward_type == "mse":
             reward = -((net_return - target_return) ** 2)
 
         elif reward_type == "sharpe" or reward_type == "combined":
-            # Compute Sharpe-ratio-based reward from daily returns.
-            if len(daily_returns) < 2:
+            # Use all accumulated episode returns for a stable Sharpe estimate.
+            # Early steps are still noisy, but the estimate improves each period.
+            episode_returns = (
+                np.concatenate(self._all_daily_returns)
+                if self._all_daily_returns else daily_returns
+            )
+            if len(episode_returns) < 2:
                 return 0.0
             daily_rf = self.config.risk_free_rate / 252
-            ret_exc = daily_returns - daily_rf
-            mean_excess = ret_exc.mean()
-            std_excess = ret_exc.std()
-            if std_excess < 1e-8:
-                sharpe = mean_excess * np.sqrt(252)  # If no variance, just return scaled mean
-            else:
-                sharpe = (mean_excess / std_excess) * np.sqrt(252)
+            ret_exc = episode_returns - daily_rf
+            std_exc = ret_exc.std()
+            sharpe = (
+                ret_exc.mean() * np.sqrt(252) if std_exc < 1e-8
+                else (ret_exc.mean() / std_exc) * np.sqrt(252)
+            )
 
             if reward_type == "sharpe":
                 reward = sharpe
-
-            elif reward_type == "combined":
-                # Combine Sharpe-like reward with penalties
-  
+            else:  # combined
                 # Drawdown penalty
                 dd_penalty = 0.0
                 if len(self._portfolio_values) >= 2:
@@ -394,8 +399,9 @@ class PortfolioEnv:
                     drawdown = (peak - current) / peak
                     dd_penalty = drawdown * self.config.drawdown_penalty
 
-                # Turnover penalty
-                turnover_penalty = turnover * self.config.turnover_penalty
+                # Turnover penalty — only excess above threshold is penalized
+                excess_turnover = max(0.0, turnover - self.config.turnover_threshold)
+                turnover_penalty = excess_turnover * self.config.turnover_penalty
 
                 reward = sharpe - dd_penalty - turnover_penalty
 

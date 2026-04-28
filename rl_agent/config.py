@@ -27,11 +27,12 @@ class EnvironmentConfig:
     transaction_cost = 0.001  # 10 bps in decimal
 
     # Reward settings - determines the learning signal for the agent
-    reward_type: Literal["sharpe", "mse", "combined"] = "combined"
-    sharpe_window: int = 252  # Rolling window for Sharpe calculation, i.e. 21, 63, 126, 252 days   
+    reward_type: Literal["sharpe", "mse", "combined", "return"] = "return"
+    sharpe_window: int = 252  # Rolling window for Sharpe calculation, i.e. 21, 63, 126, 252 days
     risk_free_rate: float = 0.0  # Annualized risk-free rate
     drawdown_penalty: float = 0.5  # Penalty weight for drawdowns
     turnover_penalty: float = 0.1  # Penalty weight for portfolio turnover
+    turnover_threshold: float = 0.20  # Turnover below this level is not penalized (free rebalancing band)
     target_returns: pd.DataFrame | None = None  # Optional benchmark returns for MSE reward
 
     # Data lookback for state construction - determines how much historical data the agent sees
@@ -48,13 +49,13 @@ class BacktestConfig:
     step_size: int = 1  # Roll forward by N months or weeks for the next window
 
     # Training per window
-    episodes_per_window: int = 200  # Episodes to train each window
+    episodes_per_window: int = 500  # Episodes to train each window
     warmstart: bool = True  # Initialize from previous window's model
-    warmstart_lr_factor: float = 0.3  # Reduce LR when warm-starting
+    warmstart_lr_factor: float = 0.5  # Reduce LR when warm-starting
 
     # Early stopping within each window
-    patience: int = 30  # Stop if no improvement for N episodes
-    min_episodes: int = 50  # Always train at least this many episodes
+    patience: int = 50  # Stop if no improvement for N episodes
+    min_episodes: int = 100  # Always train at least this many episodes
 
     # Universe handling
     min_active_stocks: int = 30  # Minimum number of active stocks required
@@ -74,7 +75,6 @@ class FeatureConfig:
 
     # Technical indicators
     volatility_windows: list[int] = field(default_factory=lambda: [21, 63, 128, 252]) 
-    momentum_windows: list[int] = field(default_factory=lambda: [21, 63, 128, 252])
     rsi_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -83,7 +83,7 @@ class FeatureConfig:
     bollinger_std: float = 2.0
     
     # Cross-sectional features
-    use_cross_sectional_rank: bool = False
+    use_cross_sectional_rank: bool = True  # Whether to include cross-sectional ranks of features
 
     # Feature normalization
     normalize_method: Literal["zscore", "minmax"] = "zscore"

@@ -123,18 +123,14 @@ class FeatureConstructor:
             vol = ret.rolling(w).std() * np.sqrt(252)
             self._features[f"vol_{w}d"] = vol
 
-        # Momentum (Time-series) 
-        for w in self.config.momentum_windows:
-            self._features[f"mom_{w}d"] = self.prices.pct_change(w)
-
         # RSI
         self._features["rsi"] = self._compute_rsi(ret, self.config.rsi_period)
 
-        # MACD
-        macd_line, signal_line = self._compute_macd(
+        # PPO (Percentage Price Oscillator) — scale-invariant version of MACD
+        ppo_line, ppo_signal = self._compute_ppo(
             self.prices, self.config.macd_fast, self.config.macd_slow, self.config.macd_signal
-            )
-        self._features["macd"] = macd_line - signal_line
+        )
+        self._features["ppo"] = ppo_line - ppo_signal
 
         # Bollinger Band position
         self._features["bbpos"] = self._compute_bollinger_position(
@@ -212,14 +208,15 @@ class FeatureConstructor:
         return (rsi - 50) / 50
 
     @staticmethod
-    def _compute_macd(prices: pd.DataFrame, fast: int, slow: int, signal: int
-                      ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """MACD line and signal line"""
+    def _compute_ppo(prices: pd.DataFrame, fast: int, slow: int, signal: int
+                     ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Percentage Price Oscillator — MACD expressed as % of slow EMA.
+        Scale-invariant: a $10 stock and a $200 stock produce comparable values."""
         ema_fast = prices.ewm(span=fast, min_periods=fast).mean()
         ema_slow = prices.ewm(span=slow, min_periods=slow).mean()
-        macd_line = ema_fast - ema_slow
-        signal_line = macd_line.ewm(span=signal, min_periods=signal).mean()
-        return macd_line, signal_line
+        ppo_line = (ema_fast - ema_slow) / ema_slow.abs().replace(0, 1e-10) * 100
+        signal_line = ppo_line.ewm(span=signal, min_periods=signal).mean()
+        return ppo_line, signal_line
 
     @staticmethod
     def _compute_bollinger_position(prices: pd.DataFrame, period: int, num_std: float
