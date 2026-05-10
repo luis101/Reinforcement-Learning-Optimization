@@ -26,8 +26,9 @@ from pathlib import Path
 
 from .config import EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
 from .environment import PortfolioEnv
-from .algo import PPOAgent, Transition
+from .algo import PPOAgent
 from .features import FeatureConstructor
+from .training import Train
 from .universe import DynamicUniverse
 from .utils import compute_portfolio_metrics, format_metrics
 
@@ -318,7 +319,8 @@ class WalkForwardBacktestEngine:
 
         # Filter valid training windows
         valid = ((train_end_date - train_start_date) >= (
-            pd.Timedelta(days=(warmup + 252)*(365/252)))) # At least 1 year of effective training data after warmup
+            pd.Timedelta(days=(warmup + self.wf_config.train_window_start * 252)*(365/252)))) 
+        # At least train_window_start years of effective training data after warmup
         #         ) & (train_start_date >= self.prices.index[0]) # Training start must be within price data
 
         train_start_date = train_start_date[valid]
@@ -352,31 +354,31 @@ class WalkForwardBacktestEngine:
         """
         Train (or warm-start) an agent on one window of data.
 
+        Delegates the training loop to Train, keeping warm-start state
+        management here in the engine.
+
         Returns:
             (trained_agent, training_info_dict)
         """
-        # Create environment for this window
         env_config = copy.deepcopy(self.env_config)
         env_config.n_stocks = train_prices.shape[1]
-
-        feature_config = copy.deepcopy(self.feat_config)
-        net_config = copy.deepcopy(self.net_config)
         train_config = copy.deepcopy(self.train_config)
 
-        # Adjust training config for walk-forward
+        # Adjust config for walk-forward: set episode count, disable disk saves
         train_config.n_episodes = self.wf_config.episodes_per_window
         train_config.eval_frequency = max(1, self.wf_config.episodes_per_window // 5)
-        train_config.save_frequency = self.wf_config.episodes_per_window + 1  # Don't save
+        train_config.save_frequency = self.wf_config.episodes_per_window + 1
 
-        train_env = PortfolioEnv(train_prices, returns=train_returns,
-                                 target_returns=self.env_config.target_returns,
-                                 env_config=env_config, feature_config=feature_config,
-                                 )
+        train_env = PortfolioEnv(
+            train_prices, returns=train_returns,
+            target_returns=self.env_config.target_returns,
+            env_config=env_config,
+            feature_config=copy.deepcopy(self.feat_config),
+        )
 
-        # Create or warm-start agent
+        # Create a fresh agent or warm-start from the previous window
         if self.wf_config.warmstart and self._current_agent is not None:
             agent = self._current_agent
-            # Reduce learning rate for fine-tuning
             lr_factor = self.wf_config.warmstart_lr_factor
             for pg in agent.actor_optimizer.param_groups:
                 pg["lr"] = train_config.lr_actor * lr_factor
@@ -389,80 +391,30 @@ class WalkForwardBacktestEngine:
                 stock_feature_dim=train_env.stock_feature_dim,
                 market_feature_dim=train_env.market_feature_dim,
                 train_config=train_config,
-                net_config=net_config,
+                net_config=copy.deepcopy(self.net_config),
                 env_config=env_config,
             )
 
-        # Training loop with early stopping and best-checkpoint tracking
-        best_reward = -np.inf
-        best_state_dict = None
-        patience_counter = 0
-        episode_rewards = []
+        trainer = Train(
+            agent=agent,
+            train_env=train_env,
+            train_config=train_config,
+            action_mask=active_mask,
+        )
+        result = trainer.train(
+            patience=self.wf_config.patience,
+            min_episodes=self.wf_config.min_episodes,
+            verbose=False,
+        )
 
-        for ep in range(1, train_config.n_episodes + 1):
-            # Collect rollout
-            flat_state, stock_feats, market_feats = train_env.reset()
-            total_reward = 0.0
-            done = False
-
-            while not done:
-                action, log_prob, value = agent.select_action(
-                    stock_feats, market_feats
-                )
-
-                # Apply universe mask to action before stepping
-                action[~active_mask[: len(action)]] = -1e6  # Will be zeroed by softmax/processing
-
-                result = train_env.step(action)
-
-                agent.store_transition(
-                    Transition(
-                        stock_features=stock_feats,
-                        market_features=market_feats,
-                        action=action,
-                        log_prob=log_prob,
-                        reward=result.reward,
-                        value=value,
-                        done=result.done,
-                    )
-                )
-
-                stock_feats = result.stock_features
-                market_feats = result.market_features
-                done = result.done
-                total_reward += result.reward
-
-            # PPO update
-            agent.update()
-            episode_rewards.append(total_reward)
-
-            # Early stopping check (on rolling average); snapshot best weights
-            if ep >= self.wf_config.min_episodes:
-                recent_avg = np.mean(episode_rewards[-20:])
-                if recent_avg > best_reward + 0.001:
-                    best_reward = recent_avg
-                    best_state_dict = copy.deepcopy(agent.ac.state_dict())
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= self.wf_config.patience:
-                    break
-
-        # Restore the best-performing weights for OOS application
-        if best_state_dict is not None:
-            agent.ac.load_state_dict(best_state_dict)
-
-        # Store agent for next window's warm-start
+        # Store agent (best weights already restored by Train) for next warm-start
         self._current_agent = agent
 
-        info = {
-            "episodes": ep,
-            "final_reward": np.mean(episode_rewards[-10:]) if episode_rewards else 0.0,
-            "best_reward": best_reward,
+        return agent, {
+            "episodes": result["episodes"],
+            "final_reward": result["final_reward"],
+            "best_reward": result["best_reward"],
         }
-
-        return agent, info
 
     ###### Out-of-sample application ######
 
@@ -537,13 +489,13 @@ class WalkForwardBacktestEngine:
         oos_returns = self.returns.loc[oos_start_date:oos_end_date].fillna(0) 
         daily_port_ret = (oos_returns.values @ weights[:n_stocks]).astype(np.float64)
 
-        # Apply transaction costs (assume rebalancing from previous weights)
+        # Apply transaction costs: turnover is measured from the drifted end-of-previous-period weights
         tc_rate = (self.env_config.transaction_cost_bps + self.env_config.slippage_bps) / 10_000
-        if len(self.results) > 0:
-            prev_weights = self.results[-1].oos_weights
-            turnover = np.sum(np.abs(weights - prev_weights))
+        if prev_end_weights is not None:
+            n = min(len(weights), len(prev_end_weights))
+            turnover = np.sum(np.abs(weights[:n] - prev_end_weights[:n]))
         else:
-            turnover = np.sum(np.abs(weights))  # From cash
+            turnover = np.sum(np.abs(weights))  # First window: rebalancing from cash
         tc = turnover * tc_rate
 
         total_raw_return = np.prod(1 + daily_port_ret) - 1

@@ -27,10 +27,10 @@ class EnvironmentConfig:
     transaction_cost = 0.001  # 10 bps in decimal
 
     # Reward settings - determines the learning signal for the agent
-    reward_type: Literal["sharpe", "mse", "combined", "return"] = "return"
+    reward_type: Literal["sharpe", "mse", "combined", "return"] = "sharpe"
     sharpe_window: int = 252  # Rolling window for Sharpe calculation, i.e. 21, 63, 126, 252 days
     risk_free_rate: float = 0.0  # Annualized risk-free rate
-    drawdown_penalty: float = 0.5  # Penalty weight for drawdowns
+    drawdown_penalty: float = 0.3  # Penalty weight for drawdowns
     turnover_penalty: float = 0.1  # Penalty weight for portfolio turnover
     turnover_threshold: float = 0.20  # Turnover below this level is not penalized (free rebalancing band)
     target_returns: pd.DataFrame | None = None  # Optional benchmark returns for MSE reward
@@ -46,6 +46,7 @@ class BacktestConfig:
 
     # Window settings
     train_window_years: float = 5.0  # Training window in years - Amount of historical data to train on for each window
+    train_window_start: float = 2.0  # Train window years required in addition to warmup period before first window starts 
     step_size: int = 1  # Roll forward by N months or weeks for the next window
 
     # Training per window
@@ -100,12 +101,14 @@ class NetworkConfig:
     # Cross-asset attention
     use_attention: bool = True
     attention_heads: int = 4
-    attention_dim: int = 64
+    attention_dim: int = 128
 
     # Actor network
     actor_hidden_dims: list[int] = field(default_factory=lambda: [256, 128])
     actor_log_std_min: float = -10.0 # (-20, -10, -5) Minimum log std for action distribution to prevent collapse to deterministic policy
-    actor_log_std_max: float = 1.0 # (0, 1, 2, 5) Maximum log std for action distribution to prevent excessive exploration
+    actor_log_std_max: float = 2.0 # (0, 1, 2, 5) Maximum log std for action distribution to prevent excessive exploration
+    # Output layer init: "orthogonal" (structured near-equal-weight), "normal" (simple near-equal-weight), "xavier" (standard DL init, no equal-weight bias)
+    policy_output_init: Literal["orthogonal", "normal", "xavier"] = "xavier"
 
     # Critic network
     critic_hidden_dims: list[int] = field(default_factory=lambda: [256, 128])
@@ -121,8 +124,8 @@ class TrainingConfig:
     """Training hyperparameters."""
 
     # PPO hyperparameters
-    lr_actor: float = 3e-4
-    lr_critic: float = 1e-3
+    lr_actor: float = 0.0005
+    lr_critic: float = 0.001
     gamma: float = 0.99  # Discount factor
     gae_lambda: float = 0.95  # GAE lambda
     clip_epsilon: float = 0.2  # PPO clipping
@@ -159,7 +162,7 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
 
     # Loss function for critic
-    critic_loss: Literal["mse", "huber"] = "huber"
+    critic_loss: Literal["mse", "huber"] = "mse"
 
 
 @dataclass

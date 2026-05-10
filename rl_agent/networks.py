@@ -163,6 +163,19 @@ class ActorNetwork(nn.Module):
             use_layer_norm=net_config.use_layer_norm,
         )
 
+        # Initialize output layer according to config.
+        # All three options keep weights small so softmax ≈ equal-weight at start
+        # while ensuring non-zero W_out so gradients flow to hidden layers.
+        out_layer = self.policy_mlp.net[-1]
+        init = net_config.policy_output_init
+        if init == "orthogonal":
+            nn.init.orthogonal_(out_layer.weight, gain=0.01)
+        elif init == "normal":
+            nn.init.normal_(out_layer.weight, mean=0.0, std=0.01)
+        elif init == "xavier":
+            nn.init.xavier_uniform_(out_layer.weight)
+        nn.init.zeros_(out_layer.bias)
+
         # Learnable log standard deviation
         self.log_std = nn.Parameter(torch.zeros(n_stocks))
         self.log_std_min = net_config.actor_log_std_min

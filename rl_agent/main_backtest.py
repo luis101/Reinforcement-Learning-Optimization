@@ -29,7 +29,7 @@ from rl_agent.utils import (
 )
 
 ticker, sp500 = get_sp500()
-prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
+prices = pd.read_csv("prices.csv", index_col=0, parse_dates=True)
 engine = WalkForwardBacktestEngine(prices)
 
 def main():
@@ -40,7 +40,7 @@ def main():
     # _, _, prices = download_fin_data(ticker=ticker, sp500=sp500)
     #prices.index = prices.index.tz_localize(None)
 
-    prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
+    prices = pd.read_csv("prices.csv", index_col=0, parse_dates=True)
 
     # prices = daily_prices.pivot(index=prices.index, columns="Ticker", values="Price")
     
@@ -70,12 +70,12 @@ def main():
         for year, ret in annual.items():
             print(f"    {year}: {ret:+.2%}")
 
-    # Overall metrics
-    rl_returns = results["oos_returns"]
-    rl_values = np.cumprod(np.concatenate([[1.0], 1 + rl_returns]))
+    #  Overall metrics
+    # rl_returns = results["oos_returns"]
+    # rl_values = np.cumprod(np.concatenate([[1.0], 1 + rl_returns]))
     # pd.DataFrame(rl_values).to_csv("C:\\Users\\lukas\\Downloads\\rl_portfolio_values.csv")
-    rl_metrics = compute_portfolio_metrics(rl_values, rl_returns, periods_per_year=12)
-    print(format_metrics(rl_metrics))
+    # rl_metrics = compute_portfolio_metrics(rl_values, rl_returns, periods_per_year=12)
+    # print(format_metrics(rl_metrics))
 
     # Weight concentration
     weight_df = engine.get_weight_history()
@@ -88,37 +88,46 @@ def main():
         print(f"    Average top-5 concentration: {top5_avg:.2%}")
         print(f"    Average non-zero positions:  {n_nonzero_avg:.0f}")
 
-    weight_df.to_csv("C:\\Users\\lukas\\Downloads\\weights_rl.csv")
+    weight_df.to_csv("weights_rl.csv")
 
-    # Compare to equal-weight benchmark
-    print("\n  Equal-weight benchmark (same OOS periods):")
-    # returns = engine.prices.pct_change().fillna(0)
-    bm_prices = engine.prices.mask(engine.prices < 1)
-    returns = bm_prices.pct_change()
-    returns = returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1).fillna(0)
-    
-    # bm_returns = []
+    # Compare to equal-weight benchmark. Use same daily return data as RL (already winsorized once in the engine)
+    returns = engine.returns.fillna(0)
+
+    # Active mask
     period_returns = []
     active_mask = pd.DataFrame()  
-    # for r in results["window_results"]:
-    #    period_ret = returns.loc[r.oos_start:r.oos_end]
-    #    active = r.active_mask[: prices.shape[1]]
-    #    ew_daily = period_ret.iloc[:, active].mean(axis=1)
-    #    bm_returns.append(np.prod(1 + ew_daily.values) - 1)
-    # for r in results["window_results"]:
-    #    start = prices.index.get_indexer([r.oos_start], method="ffill")[0]
-    #    end = prices.index.get_indexer([r.oos_end], method="ffill")[0]
-    #    period_ret = prices.iloc[start:end + 1].pct_change().fillna(0)
-    #    active = r.active_mask[: prices.shape[1]]
-    #    ew_daily = period_ret.iloc[:, active].mean(axis=1).values
-    #    bm_returns.append(np.prod(1 + ew_daily) - 1)
     for r in results["window_results"]:
         active_mask = pd.concat([active_mask, pd.DataFrame([r.active_mask])])
         period_df = returns.loc[r.oos_start:r.oos_end]
         period_returns.append((1 + period_df).prod() - 1)
+    pd.DataFrame(active_mask).to_csv("active_mask.csv")
 
-    masked_returns = pd.DataFrame(period_returns).where(active_mask.values, np.nan)
-    bm_returns = masked_returns.mean(axis=1).fillna(0).values
+    # bm_prices = engine.prices.mask(engine.prices < 1)
+    # returns = bm_prices.pct_change()
+    # returns = returns.apply(lambda x: x.clip(lower=x.quantile(0.01), upper=x.quantile(0.99)), axis=1).fillna(0)
+    
+    #  Compute RL and BM portfolio returns by applying the same active mask to the returns, then averaging across active stocks
+    # masked_returns = pd.DataFrame(period_returns).where(active_mask.values, np.nan)
+    # bm_returns = masked_returns.mean(axis=1).fillna(0).values
+    # portfolio_returns = pd.DataFrame(masked_returns.values * weight_df.values)  
+    # pt_returns = portfolio_returns.sum(axis=1).fillna(0).values
+    # pt_values = np.cumprod(np.concatenate([[1.0], 1 + pt_returns]))
+    # pd.DataFrame(pt_values).to_csv("C:\\Users\\lukas\\Downloads\\pt_portfolio_values.csv")
+
+    # pt_metrics = compute_portfolio_metrics(pt_values, pt_returns, periods_per_year=12)
+    # print(format_metrics(pt_metrics))
+
+    bm_period_returns = []
+    for r in results["window_results"]:
+        active = r.active_mask[:prices.shape[1]]
+        n_active = int(active.sum())
+        ew = np.zeros(prices.shape[1])
+        if n_active > 0:
+            ew[active] = 1.0 / n_active
+        period_df = returns.loc[r.oos_start:r.oos_end]
+        daily_ew = period_df.values @ ew
+        bm_period_returns.append(float(np.prod(1 + daily_ew) - 1))
+    bm_returns = np.array(bm_period_returns)
 
     # Compute equal-weight TC: each period weights drift with returns,
     # and must be rebalanced back to equal weight at the next period start.
@@ -142,7 +151,7 @@ def main():
     bm_net_rets = bm_returns - np.array(bm_tc_per_period)
 
     bm_values = np.cumprod(np.concatenate([[1.0], 1 + bm_returns]))
-    pd.DataFrame(bm_values).to_csv("C:\\Users\\lukas\\Downloads\\bm_portfolio_values.csv")
+    pd.DataFrame(bm_values).to_csv("bm_portfolio_values.csv")
         
     bm_metrics = compute_portfolio_metrics(bm_values, bm_returns, periods_per_year=12)
     print(format_metrics(bm_metrics))
