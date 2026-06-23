@@ -29,6 +29,9 @@ class Transition(NamedTuple):
     reward: float
     value: float
     done: bool
+    # LSTM hidden state that fed this step (h_in, c_in), each (lstm_hidden_dim,) or None
+    h_in: np.ndarray | None = None
+    c_in: np.ndarray | None = None
 
 
 class RolloutBuffer:
@@ -102,6 +105,19 @@ class RolloutBuffer:
 
             batch_transitions = [self.transitions[i] for i in batch_idx]
 
+            # Per-sample LSTM hidden states stacked to (1, B, H), or None
+            if batch_transitions[0].h_in is None:
+                hidden = None
+            else:
+                hidden = (
+                    torch.FloatTensor(
+                        np.stack([t.h_in for t in batch_transitions])
+                    ).unsqueeze(0).to(device),
+                    torch.FloatTensor(
+                        np.stack([t.c_in for t in batch_transitions])
+                    ).unsqueeze(0).to(device)
+                )
+
             yield {
                 "stock_features": torch.FloatTensor(
                     np.stack([t.stock_features for t in batch_transitions])
@@ -117,6 +133,7 @@ class RolloutBuffer:
                 ).to(device),
                 "returns": torch.FloatTensor(returns[batch_idx]).to(device),
                 "advantages": torch.FloatTensor(advantages[batch_idx]).to(device),
+                "hidden": hidden
             }
 
 
@@ -174,6 +191,9 @@ class PPOAgent:
         # LSTM hidden state — maintained across steps within one episode.
         # reset_hidden_state() must be called at the start of every episode.
         self._lstm_h: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Input LSTM hidden of the most recent select_action, as (h_np, c_np) 
+        # each (lstm_hidden_dim,), or None.
+        self._last_h_in: tuple[np.ndarray, np.ndarray] | None = None
 
         # Per-window active-stock mask, (1, n_stocks) bool tensor or None
         self._action_mask_t: torch.Tensor | None = None
@@ -233,16 +253,45 @@ class PPOAgent:
             sf = torch.FloatTensor(stock_features).unsqueeze(0).to(self.device)
             mf = torch.FloatTensor(market_features).unsqueeze(0).to(self.device)
 
-            # Augment market features with LSTM context (no-op when LSTM disabled)
+            # Hidden state that feeds this step, captured before making the step, 
+            # so the PPO update can replay the recurrence from the same state.
+            h_prev = self._lstm_h
             mf_aug, self._lstm_h = self.ac.lstm_step(mf, self._lstm_h)
             action, log_prob = self.ac.actor.get_action(sf, mf_aug, deterministic, self._action_mask_t)
             value = self.ac.critic(sf, mf_aug, self._action_mask_t)
+
+        self._last_h_in = self._hidden_to_numpy(h_prev)
 
         return (
             action.squeeze(0).cpu().numpy(),
             log_prob.item(),
             value.item(),
         )
+
+    def _hidden_to_numpy(
+        self, hidden: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Convert an LSTM (h, c) state to stored (h_np, c_np) arrays, each (lstm_hidden_dim,).
+        """
+        if self.ac.lstm is None:
+            return None
+        if hidden is None:
+            z = np.zeros(self.ac.lstm.hidden_size, dtype=np.float32)
+            return (z, z.copy())
+        h, c = hidden
+        return (h.detach().reshape(-1).cpu().numpy(),
+                c.detach().reshape(-1).cpu().numpy())
+
+    def _numpy_to_hidden(
+        self, h_np: np.ndarray | None, c_np: np.ndarray | None
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Rebuild an LSTM (h, c) state (1, 1, H) from stored (H,) arrays, or None."""
+        if h_np is None:
+            return None
+        h = torch.FloatTensor(h_np).reshape(1, 1, -1).to(self.device)
+        c = torch.FloatTensor(c_np).reshape(1, 1, -1).to(self.device)
+        return (h, c)
     
     def _update_step(self, batch: dict) -> dict:
         """Single PPO update step on a minibatch."""
@@ -253,8 +302,9 @@ class PPOAgent:
         returns = batch["returns"]
         advantages = batch["advantages"]
 
-        # Augment market features via LSTM (hidden=None → zero-init per sample)
-        mf_aug, _ = self.ac.lstm_step(mf)
+        # Augment market features via LSTM, replaying the recurrence from the hidden
+        # state stored at rollout time (None → zero-init, e.g. when LSTM disabled).
+        mf_aug, _ = self.ac.lstm_step(mf, batch.get("hidden"))
 
         # Current policy evaluation
         mean, std = self.ac.actor.forward(sf, mf_aug, self._action_mask_t)
@@ -329,7 +379,8 @@ class PPOAgent:
             with torch.no_grad():
                 sf = torch.FloatTensor(last_transition.stock_features).unsqueeze(0).to(self.device)
                 mf = torch.FloatTensor(last_transition.market_features).unsqueeze(0).to(self.device)
-                mf_aug, _ = self.ac.lstm_step(mf)
+                hidden = self._numpy_to_hidden(last_transition.h_in, last_transition.c_in)
+                mf_aug, _ = self.ac.lstm_step(mf, hidden)
                 last_value = self.ac.critic(sf, mf_aug, self._action_mask_t).item()
 
         # Compute returns and advantages

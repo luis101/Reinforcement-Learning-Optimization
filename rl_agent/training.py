@@ -122,6 +122,8 @@ class Train:
                     sf_in, mf_in = stock_feats, market_feats
 
                 action, log_prob, value = self.agent.select_action(sf_in, mf_in)
+                # LSTM hidden state that fed this step
+                h_in, c_in = self.agent._last_h_in or (None, None)
 
                 if self.action_mask is not None:
                     action[~self.action_mask[:len(action)]] = -1e6
@@ -137,6 +139,8 @@ class Train:
                         value=value,
                         reward=step_result.reward,
                         done=step_result.done,
+                        h_in=h_in,
+                        c_in=c_in,
                     )
                 )
 

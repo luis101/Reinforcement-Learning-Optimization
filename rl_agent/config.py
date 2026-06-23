@@ -163,8 +163,8 @@ class NetworkConfig:
     activation: Literal["relu", "gelu", "silu"] = "gelu"
 
     # LSTM temporal context — augments market features with a hidden state carried across
-    # rebalancing steps within each episode. Disabled by default.
-    use_lstm: bool = True
+    # rebalancing steps within each episode. 
+    use_lstm: bool = False
     lstm_hidden_dim: int = 64
 
 

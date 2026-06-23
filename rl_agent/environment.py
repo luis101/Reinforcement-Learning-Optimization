@@ -133,12 +133,15 @@ class PortfolioEnv:
         action = np.clip(action, -10, 10)  # Prevent numerical overflow
 
         if self.config.mode == "long_only":
-            # Softmax to get positive weights summing to 
+            # Softmax to get positive weights summing to 1
             exp_a = np.exp(action - np.max(action))  # Numerical stability
             weights = exp_a / np.sum(exp_a)
+
             # Apply max position constraint
-            weights = np.clip(weights, self.config.min_position_size, self.config.max_position_size)
-            weights /= weights.sum()  # Re-normalize
+            #weights = np.clip(weights, self.config.min_position_size, self.config.max_position_size)
+            #weights /= weights.sum()  # Renormalize
+            # Strictly enforce the max-position cap (clip-and-redistribute, sum stays 1)
+            weights = cap_long_only(weights, self.config.max_position_size)
 
         elif self.config.mode == "long_short":
             # Tanh to get values in [-1, 1]
@@ -473,3 +476,25 @@ class MultiPeriodEnv:
             prices.iloc[max(0, val_end - warmup) :],
             env_config=env_config, feature_config=feature_config,
         )
+
+
+def cap_long_only(w: np.ndarray, cap: float) -> np.ndarray:
+    """
+    Project nonnegative weights onto {0 <= w <= cap, sum w = 1}: clip to the cap,
+    spread the left amount over the uncapped assets in proportion to weights.
+    """
+    w = np.maximum(w, 0.0).astype(float)
+    s = w.sum()
+    if s < 1e-12:
+        return w
+    w = w / s
+    for _ in range(w.size):
+        w = np.minimum(w, cap)
+        res = 1.0 - w.sum()
+        w_avail = w < cap
+        fs = w[w_avail].sum()
+        if res < 1e-12 or fs < 1e-12:
+            break
+        w[w_avail] += res * w[w_avail] / fs
+    return w
+

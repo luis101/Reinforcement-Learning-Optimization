@@ -26,7 +26,7 @@ from pathlib import Path
 from sklearn.model_selection import KFold
 
 from .config import EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
-from .environment import PortfolioEnv
+from .environment import PortfolioEnv, cap_long_only
 from .algo import PPOAgent
 from .features import FeatureConstructor
 from .training import Train
@@ -677,10 +677,11 @@ class WalkForwardBacktestEngine:
             exp_a[~active_mask] = 0.0
             weights = exp_a / np.sum(exp_a) if np.sum(exp_a) > 1e-10 else np.zeros(n)
             # Apply position limits
-            max_pos = self.env_config.max_position_size
-            weights = np.clip(weights, 0, max_pos)
-            if weights.sum() > 1e-10:
-                weights /= weights.sum()
+            #weights = np.clip(weights, 0, self.env_config.max_position_size)
+            #if weights.sum() > 1e-10:
+            #    weights /= weights.sum()
+            # Strictly enforce the max-position cap (clip-and-redistribute, sum stays 1)
+            weights = cap_long_only(weights, self.env_config.max_position_size)
         elif self.env_config.mode == "long_short":
             weights = np.tanh(action)
             weights[~active_mask] = 0.0

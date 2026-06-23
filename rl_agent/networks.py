@@ -283,6 +283,9 @@ class ActorNetwork(nn.Module):
         if self.use_temperature:
             action_mean = action_mean / self.temperature.clamp(min=self.temperature_min)
 
+        # Pin the logit mean to the zero-sum hyperplane, removes drift from Gaussian mean
+        action_mean = action_mean - action_mean.mean(dim=-1, keepdim=True)
+
         # Clamped log_std → std
         log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
         # action_std = log_std.exp().expand_as(action_mean)
