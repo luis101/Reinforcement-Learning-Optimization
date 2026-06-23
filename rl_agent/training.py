@@ -65,9 +65,7 @@ class Train:
         self.eval_history: list[dict] = []
         self.best_val_sharpe: float = -np.inf
 
-    def train(self,
-              patience: int | None = None, min_episodes: int = 0, verbose: bool = True
-              ) -> dict:
+    def train(self, patience: int | None = None, min_episodes: int = 0, verbose: bool = True) -> dict:
         """
         Run the training loop.
 
@@ -96,20 +94,34 @@ class Train:
 
         start_time = time.time()
 
+        # Tell the agent which stocks are active
+        self.agent.set_action_mask(self.action_mask)
+
         best_reward = -np.inf
         best_state_dict: dict | None = None
         patience_counter = 0
         ep = 0
+        dropout_rate = self.tc.feature_dropout_rate
 
         for episode in range(1, self.tc.n_episodes + 1):
             ep = episode
 
+            self.agent.reset_hidden_state()
             _, stock_feats, market_feats = self.train_env.reset()
             episode_reward = 0.0
+            step_count = 0
             done = False
 
             while not done:
-                action, log_prob, value = self.agent.select_action(stock_feats, market_feats)
+                if dropout_rate > 0.0:
+                    sf_in = stock_feats.copy()
+                    sf_in[:, np.random.rand(stock_feats.shape[1]) < dropout_rate] = 0.0
+                    mf_in = market_feats.copy()
+                    mf_in[np.random.rand(market_feats.shape[0]) < dropout_rate] = 0.0
+                else:
+                    sf_in, mf_in = stock_feats, market_feats
+
+                action, log_prob, value = self.agent.select_action(sf_in, mf_in)
 
                 if self.action_mask is not None:
                     action[~self.action_mask[:len(action)]] = -1e6
@@ -118,8 +130,8 @@ class Train:
 
                 self.agent.store_transition(
                     Transition(
-                        stock_features=stock_feats,
-                        market_features=market_feats,
+                        stock_features=sf_in,
+                        market_features=mf_in,
                         action=action,
                         log_prob=log_prob,
                         value=value,
@@ -132,8 +144,9 @@ class Train:
                 market_feats = step_result.market_features
                 done = step_result.done
                 episode_reward += step_result.reward
+                step_count += 1
 
-            self.episode_rewards.append(episode_reward)
+            self.episode_rewards.append(episode_reward / max(1, step_count))
             update_stats = self.agent.update()
 
             if verbose and (episode % 10 == 0 or episode == 1):
@@ -141,7 +154,7 @@ class Train:
                 avg_reward = float(np.mean(self.episode_rewards[-50:]))
                 print(
                     f"Episode {episode:4d}/{self.tc.n_episodes} | "
-                    f"Reward: {episode_reward:+8.4f} | "
+                    f"Reward: {episode_reward / max(1, step_count):+8.4f} | "
                     f"Avg (last 50): {avg_reward:+8.4f} | "
                     f"Policy loss: {update_stats.get('policy_loss', 0):+.4f} | "
                     f"Value loss: {update_stats.get('value_loss', 0):.4f} | "
@@ -188,6 +201,7 @@ class Train:
         # Restore best weights so the returned agent has peak performance
         if best_state_dict is not None:
             self.agent.ac.load_state_dict(best_state_dict)
+            self.agent.ac.flatten_lstm_parameters()
 
         # Final evaluation and disk save (standalone mode only)
         final_eval: dict = {}

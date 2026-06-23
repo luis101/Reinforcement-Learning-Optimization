@@ -12,8 +12,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# import os
-# os.chdir("..")
+import os
+os.chdir("..")
 
 # from rl_agent.config import (
 #    Config, 
@@ -28,9 +28,9 @@ from rl_agent.utils import (
     generate_realistic_universe
 )
 
-ticker, sp500 = get_sp500()
-prices = pd.read_csv("prices.csv", index_col=0, parse_dates=True)
-engine = WalkForwardBacktestEngine(prices)
+# ticker, sp500 = get_sp500()
+# prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
+# engine = WalkForwardBacktestEngine(prices)
 
 def main():
     
@@ -40,7 +40,7 @@ def main():
     # _, _, prices = download_fin_data(ticker=ticker, sp500=sp500)
     #prices.index = prices.index.tz_localize(None)
 
-    prices = pd.read_csv("prices.csv", index_col=0, parse_dates=True)
+    prices = pd.read_csv("C:\\Users\\lukas\\Downloads\\prices.csv", index_col=0, parse_dates=True)
 
     # prices = daily_prices.pivot(index=prices.index, columns="Ticker", values="Price")
     
@@ -55,7 +55,7 @@ def main():
 
     # Run walk-forward optimization
     engine = WalkForwardBacktestEngine(prices)
-    results = engine.run()
+    results = engine.run(kfold_init=True)
 
     # Analyze results
     print("\n" + "=" * 50)
@@ -88,7 +88,7 @@ def main():
         print(f"    Average top-5 concentration: {top5_avg:.2%}")
         print(f"    Average non-zero positions:  {n_nonzero_avg:.0f}")
 
-    weight_df.to_csv("weights_rl.csv")
+    weight_df.to_csv("C:\\Users\\lukas\\Downloads\\weights_rl.csv")
 
     # Compare to equal-weight benchmark. Use same daily return data as RL (already winsorized once in the engine)
     returns = engine.returns.fillna(0)
@@ -100,7 +100,7 @@ def main():
         active_mask = pd.concat([active_mask, pd.DataFrame([r.active_mask])])
         period_df = returns.loc[r.oos_start:r.oos_end]
         period_returns.append((1 + period_df).prod() - 1)
-    pd.DataFrame(active_mask).to_csv("active_mask.csv")
+    pd.DataFrame(active_mask).to_csv("C:\\Users\\lukas\\Downloads\\active_mask.csv")
 
     # bm_prices = engine.prices.mask(engine.prices < 1)
     # returns = bm_prices.pct_change()
@@ -151,7 +151,7 @@ def main():
     bm_net_rets = bm_returns - np.array(bm_tc_per_period)
 
     bm_values = np.cumprod(np.concatenate([[1.0], 1 + bm_returns]))
-    pd.DataFrame(bm_values).to_csv("bm_portfolio_values.csv")
+    pd.DataFrame(bm_values).to_csv("C:\\Users\\lukas\\Downloads\\bm_portfolio_values.csv")
         
     bm_metrics = compute_portfolio_metrics(bm_values, bm_returns, periods_per_year=12)
     print(format_metrics(bm_metrics))

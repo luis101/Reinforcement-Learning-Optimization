@@ -30,6 +30,7 @@ _METRICS_FMT: dict[str, tuple[str, str]] = {
 def compute_portfolio_metrics(
     portfolio_values: np.ndarray, returns: np.ndarray | None = None,
     risk_free_rate: float = 0.0, periods_per_year: int = 252,
+    n_days: int | None = None,
     ) -> dict[str, float]:
     """
     Compute comprehensive portfolio performance metrics.
@@ -37,9 +38,14 @@ def compute_portfolio_metrics(
     Args:
         portfolio_values: Cumulative value series starting at 1.0 (length n+1).
         returns: Optional pre-computed per-period returns (length n).
-                 Pass periods_per_year=12 for monthly data, 252 for daily.
         risk_free_rate: Annualized risk-free rate.
-        periods_per_year: Number of return periods per year (252 daily, 12 monthly).
+        periods_per_year: Fallback annualization frequency when n_days is not provided
+                          (252 daily, 12 monthly, 52 weekly).
+        n_days: Actual number of trading days spanned by the return series. When
+                provided this drives all annualization regardless of step count:
+                  ann_return = (1+r)^(252/n_days) - 1
+                  ann_scale  = sqrt(252 * n / n_days)   [for vol / Sharpe]
+                Use this whenever the period length is irregular or known precisely.
 
     Returns:
         Dictionary of metrics.
@@ -51,28 +57,37 @@ def compute_portfolio_metrics(
     if n == 0:
         return {"total_return": 0.0}
 
-    period_rf = risk_free_rate / periods_per_year
+    # Annualization factors — use actual day count when available
+    if n_days is not None and n_days > 0:
+        ann_return_exp = 252.0 / n_days
+        ann_scale = np.sqrt(252.0 * n / n_days)
+        period_rf = risk_free_rate * (n_days / (252.0 * n))
+    else:
+        ann_return_exp = periods_per_year / n
+        ann_scale = np.sqrt(float(periods_per_year))
+        period_rf = risk_free_rate / periods_per_year
+
     excess_returns = returns - period_rf
 
     # Basic return metrics
     total_return = portfolio_values[-1] / portfolio_values[0] - 1
-    ann_return = (1 + total_return) ** (periods_per_year / n) - 1
+    ann_return = (1 + total_return) ** ann_return_exp - 1
 
     # Risk metrics
-    ann_vol = returns.std() * np.sqrt(periods_per_year)
+    ann_vol = returns.std() * ann_scale
     downside_returns = returns[returns < 0]
     downside_std = downside_returns.std() if len(downside_returns) > 0 else 0.0
-    downside_vol = downside_std * np.sqrt(periods_per_year)
+    downside_vol = downside_std * ann_scale
 
-    # Sharpe: (mean excess return / std excess return) * sqrt(ppy)
+    # Sharpe: (mean excess return / std excess return) * ann_scale
     sharpe = (
-        (excess_returns.mean() / excess_returns.std()) * np.sqrt(periods_per_year)
+        (excess_returns.mean() / excess_returns.std()) * ann_scale
         if excess_returns.std() > 1e-10
         else 0.0
     )
     # Sortino: same as Sharpe but uses downside std in place of total std
     sortino = (
-        (excess_returns.mean() / downside_std) * np.sqrt(periods_per_year)
+        (excess_returns.mean() / downside_std) * ann_scale
         if downside_std > 1e-10
         else 0.0
     )
@@ -250,7 +265,16 @@ def evaluate_agent(agent, env, n_episodes: int = 1) -> dict[str, Any]:
     all_values = []
     all_weights = []
 
-    for ep in range(n_episodes):
+    # Actual trading days: from first rebalancing point to end of the price data.
+    # Used for annualization: (1+r)^(252/n_days) regardless of step count.
+    n_days = (
+        len(env.prices) - env._rebalance_dates[0]
+        if env._rebalance_dates
+        else len(env.prices)
+    )
+
+    for _ in range(n_episodes):
+        agent.reset_hidden_state()
         flat_state, stock_feats, market_feats = env.reset()
 
         episode_weights = []
@@ -268,9 +292,17 @@ def evaluate_agent(agent, env, n_episodes: int = 1) -> dict[str, Any]:
 
             episode_weights.append(result.info.get("new_weights", action))
 
+        # Use daily returns for vol/Sharpe/drawdown — far more data points than
+        # rebalancing steps, giving a reliable estimate. n_days drives return annualization.
         values = env.portfolio_value_series
-        daily_rets = np.diff(values) / values[:-1]
-        metrics = compute_portfolio_metrics(values, daily_rets)
+        using_daily = bool(env._all_daily_returns)
+        daily_rets = (
+            np.concatenate(env._all_daily_returns)
+            if using_daily
+            else np.diff(values) / values[:-1]
+        )
+        daily_values = np.cumprod(np.concatenate([[1.0], 1 + daily_rets]))
+        metrics = compute_portfolio_metrics(daily_values, daily_rets, n_days=n_days)
 
         all_metrics.append(metrics)
         all_values.append(values)

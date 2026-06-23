@@ -17,12 +17,13 @@ import copy
 import time
 import numpy as np
 import pandas as pd
-import datetime as dt
+# import datetime as dt
 # import matplotlib.dates as mdates
 # import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 # from typing import Literal
+from sklearn.model_selection import KFold
 
 from .config import EnvironmentConfig, FeatureConfig, NetworkConfig, TrainingConfig, BacktestConfig
 from .environment import PortfolioEnv
@@ -84,6 +85,18 @@ class WalkForwardBacktestEngine:
         self.prices = self._get_clean_prices(prices)
         self.returns = self._get_clean_returns(prices, returns)
 
+        # Precompute all features ONCE on the full clean price history. Every per-window
+        # PortfolioEnv and the OOS application then slice into these globally normalized features, 
+        # so a given calendar date produces identical feature values regardless of which window is looking at it. 
+        # Regime features are intentionally excluded here: fitting the HMM once on the
+        # full history would leak future state into past predictions.
+        global_feat_cfg = copy.deepcopy(self.feat_config)
+        global_feat_cfg.use_regime = False
+        self._global_engine = FeatureConstructor(
+            self.prices, global_feat_cfg, returns=self.returns,
+        )
+        self._global_features = self._global_engine._features
+
         # Dynamic universe tracker
         self.universe = DynamicUniverse(
             prices, max_stocks=self.prices.shape[1]
@@ -100,9 +113,14 @@ class WalkForwardBacktestEngine:
         self.output_dir = Path(self.wf_config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self) -> dict:
+    def run(self, kfold_init: bool = False) -> dict:
         """
         Execute the full optimization based on walk-forward strategy.
+
+        Args:
+            kfold_init: If True, run k-fold cross-validation on the first window's training data
+                        before the main loop. The best fold agent (by validation Sharpe)
+                        warm-starts window 1. Number of splits is set via BacktestConfig.n_kfold_splits.
 
         Returns:
             Dictionary containing:
@@ -119,6 +137,13 @@ class WalkForwardBacktestEngine:
         print(f"  Warm-start:       {self.wf_config.warmstart}")
         print(f"  Episodes/window:  {self.wf_config.episodes_per_window}")
         print("=" * 50)
+
+        if kfold_init:
+            init_agent = self._kfold_initialize(n_splits=self.wf_config.n_kfold_splits)
+            if init_agent is not None:
+                self._current_agent = init_agent
+                print("  K-fold init complete — first window warm-starts from best fold agent.")
+                print("=" * 50)
 
         total_start = time.time()
         prev_end_weights: np.ndarray | None = None  # Drifted weights from the previous OOS period
@@ -161,7 +186,7 @@ class WalkForwardBacktestEngine:
 
             # Train the agent on this window
             window_start = time.time()
-            agent, train_info = self._train_window(window_prices, window_returns, active_mask, i)
+            agent, train_info = self._train_window(window_prices, window_returns, active_mask)
             train_time = time.time() - window_start
 
             # Get deterministic action (weights) from trained agent
@@ -220,8 +245,7 @@ class WalkForwardBacktestEngine:
 
         return summary
     
-    def _get_clean_returns(self, prices: pd.DataFrame,
-                           ext_returns: pd.DataFrame | None = None) -> pd.DataFrame:
+    def _get_clean_returns(self, prices: pd.DataFrame, ext_returns: pd.DataFrame | None = None) -> pd.DataFrame:
         """
         If returns are provided they are used directly (assuming they are pre-aligned and cleaned),
         Otherwise returns are derived from clean_prices with row-wise winsorization.
@@ -286,8 +310,17 @@ class WalkForwardBacktestEngine:
 
     ###### Determine periods for training and OOS application ######
 
+    @property
+    def _feature_warmup_days(self) -> int:
+        """Minimum trading days needed before features are valid for all configured windows."""
+        return self.feat_config.normalize_window + max(
+            max(self.feat_config.return_windows),
+            self.feat_config.macd_slow + self.feat_config.macd_signal,
+            max(self.feat_config.volatility_windows),
+        )
+
     def _get_periods(self) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
-        
+
         train_days = int(self.wf_config.train_window_years * 252)
         freq = self.env_config.rebalance_freq
         dates = self.prices.index.to_series()
@@ -301,13 +334,7 @@ class WalkForwardBacktestEngine:
         else:
             raise ValueError(f"freq must be 'weekly' or 'monthly', got {freq!r}")
 
-        # Feature warmup requirement. Minimum trading days needed for feature computation
-        warmup = self.feat_config.normalize_window + max(
-            max(self.feat_config.return_windows),
-            self.feat_config.macd_slow + self.feat_config.macd_signal,
-            max(self.feat_config.volatility_windows),
-        )
-
+        warmup = self._feature_warmup_days # Ensure we have enough data for feature warmup before the first OOS period starts
         step = self.wf_config.step_size # Roll forward by step periods (e.g. 1 month)
 
         # Train window
@@ -345,11 +372,119 @@ class WalkForwardBacktestEngine:
 
         return list(zip(train_start_date, train_end_date, oos_start_date, oos_end_date))
 
+    ###### K-Fold Initialization ######
+
+    def _kfold_initialize(self, n_splits: int = 3) -> PPOAgent | None:
+        """
+        K-fold cross-validation on the first walk-forward window's training data
+        to produce a warm-started agent before the main loop.
+
+        Uses KFold(shuffle=True) on post-warmup dates. Each fold trains a fresh agent
+        on the full first window and evaluates on a randomly selected held-out period.
+        The agent with the highest best_val_sharpe is returned.
+        """
+        if not self._windows:
+            return None
+
+        first_train_start, first_train_end, first_oos_start, _ = self._windows[0]
+
+        window_prices = self.prices.loc[first_train_start:first_train_end].copy()
+        window_returns = self.returns.loc[first_train_start:first_train_end].copy()
+        n_dates = len(window_prices)
+
+        warmup = self._feature_warmup_days
+        train_dates = window_prices.iloc[warmup:].index
+
+        if len(train_dates) < n_splits * 2:
+            print("  K-Fold Init: first window too small for cross-validation, skipping.")
+            return None
+
+        active_mask = np.zeros(self.prices.shape[1], dtype=bool)
+        active_mask[:] = ~self.prices.isna().loc[first_oos_start].values
+
+        env_config = copy.deepcopy(self.env_config)
+        env_config.n_stocks = window_prices.shape[1]
+
+        print("=" * 50)
+        print("  K-Fold Cross-Validation Initialization")
+        print(f"  Data:   {first_train_start.date()} → {first_train_end.date()} ({n_dates} days)")
+        print(f"  Splits: {n_splits}  |  Post-warmup dates: {len(train_dates)}  |  Warmup: {warmup} days")
+        print("=" * 50)
+
+        kf = KFold(n_splits=n_splits, random_state=0, shuffle=True)
+        best_sharpe: float = -np.inf
+        best_agent: PPOAgent | None = None
+
+        for k, (_, val_idx) in enumerate(kf.split(train_dates)):
+            sorted_val_idx = np.sort(val_idx)
+            # Val env: contiguous range from first to last val date, with warmup context
+            # prepended. val_context_start places exactly `warmup` rows before the first
+            # val rebalancing date, satisfying PortfolioEnv's valid_start_idx requirement.
+            val_context_start = int(sorted_val_idx[0])
+            val_end_pos = warmup + int(sorted_val_idx[-1]) + 1
+
+            fold_val_pr = window_prices.iloc[val_context_start:val_end_pos]
+            fold_val_ret = window_returns.iloc[val_context_start:val_end_pos]
+
+            print(
+                f"\n  Fold {k + 1}/{n_splits}: "
+                f"train {first_train_start.date()} → {first_train_end.date()}, "
+                f"val {train_dates[sorted_val_idx[0]].date()} → {train_dates[sorted_val_idx[-1]].date()} "
+                f"({len(sorted_val_idx)} sampled dates, "
+                f"{sorted_val_idx[-1] - sorted_val_idx[0] + 1}d range)"
+            )
+
+            train_env = PortfolioEnv(
+                window_prices, returns=window_returns,
+                target_returns=self.env_config.target_returns,
+                env_config=env_config, feature_config=copy.deepcopy(self.feat_config),
+                precomputed_features=self._global_features,
+            )
+            val_env = PortfolioEnv(
+                fold_val_pr, returns=fold_val_ret,
+                target_returns=self.env_config.target_returns,
+                env_config=env_config, feature_config=copy.deepcopy(self.feat_config),
+                precomputed_features=self._global_features,
+            )
+
+            agent = PPOAgent(
+                n_stocks=env_config.n_stocks,
+                stock_feature_dim=train_env.stock_feature_dim,
+                market_feature_dim=train_env.market_feature_dim,
+                train_config=copy.deepcopy(self.train_config),
+                net_config=copy.deepcopy(self.net_config),
+                env_config=env_config,
+            )
+
+            trainer = Train(
+                agent=agent, train_env=train_env, val_env=val_env,
+                train_config=copy.deepcopy(self.train_config),
+                action_mask=active_mask,
+            )
+            trainer.train(
+                patience=self.wf_config.patience,
+                min_episodes=self.wf_config.min_episodes,
+                verbose=True,
+            )
+
+            fold_sharpe = trainer.best_val_sharpe
+            print(f"  Fold {k + 1} best val Sharpe: {fold_sharpe:.3f}")
+
+            if fold_sharpe > best_sharpe:
+                best_sharpe = fold_sharpe
+                best_agent = copy.deepcopy(agent)
+
+        if best_agent is not None:
+            print(f"\n  Best initialization Sharpe: {best_sharpe:.3f}")
+        else:
+            print("\n  No valid fold produced a best_val_sharpe; first window starts fresh.")
+
+        return best_agent
+
     ###### Training ######
 
     def _train_window(self,
-        train_prices: pd.DataFrame, train_returns: pd.DataFrame,
-        active_mask: np.ndarray, window_idx: int,
+        train_prices: pd.DataFrame, train_returns: pd.DataFrame, active_mask: np.ndarray,
         ) -> tuple[PPOAgent, dict]:
         """
         Train (or warm-start) an agent on one window of data.
@@ -374,6 +509,7 @@ class WalkForwardBacktestEngine:
             target_returns=self.env_config.target_returns,
             env_config=env_config,
             feature_config=copy.deepcopy(self.feat_config),
+            precomputed_features=self._global_features,
         )
 
         # Create a fresh agent or warm-start from the previous window
@@ -431,33 +567,12 @@ class WalkForwardBacktestEngine:
         Returns:
             (weights, total_return, daily_returns)
         """
-        # Build the state at the OOS start date using full price history
-        # We need features computed up to oos_start, so use a lookback window that covers all feature requirements
-        lookback = self.feat_config.normalize_window + 100
-        feature_start = max(self.prices.index[0], oos_start_date - pd.Timedelta(days=lookback))
-        feature_prices = self.prices.loc[feature_start:oos_end_date].copy()
-        
-        feature_prices = feature_prices.ffill().bfill()
-        for col in feature_prices.columns:
-            if feature_prices[col].isna().all():
-                feature_prices[col] = 100.0
-
-        # Create a temporary environment just to get the state
-        env_config = copy.deepcopy(self.env_config)
-        env_config.n_stocks = feature_prices.shape[1]
-        feat_config = copy.deepcopy(self.feat_config)
-
-        feat_engine = FeatureConstructor(feature_prices, feat_config)
-
-        # Get state at the OOS start (relative to feature_prices)
-        # relative_oos_start = oos_start_date - (oos_start_date - feature_start)
-        # relative_oos_start_idx = self.prices.index.get_indexer([relative_oos_start], method='ffill')[0]
-        relative_oos_start_idx = feature_prices.index.get_indexer([oos_start_date], method='ffill')[0]
-        stock_feats = feat_engine.get_stock_features(relative_oos_start_idx)
+        # Use the globally precomputed feature engine — same normalization context
+        # the agent saw during training, so no train/OOS distribution shift.
+        n_stocks = self.prices.shape[1]
 
         # Initial weights: use drifted end-of-previous-period weights so the agent
         # sees a realistic pre-rebalance state. Fall back to equal weight on the first window.
-        n_stocks = feature_prices.shape[1]
         n_active = active_mask[:n_stocks].sum()
         if prev_end_weights is not None and len(prev_end_weights) >= n_stocks:
             current_weights = prev_end_weights[:n_stocks].copy().astype(np.float32)
@@ -473,11 +588,47 @@ class WalkForwardBacktestEngine:
             if n_active > 0:
                 current_weights[active_mask[:n_stocks]] = 1.0 / n_active
 
-        stock_feats = np.hstack([stock_feats, current_weights.reshape(-1, 1)])
-        # market_feats = feat_engine.get_market_features(relative_oos_start)
-        market_feats = feat_engine.get_market_features(relative_oos_start_idx)
+        # Look up features at the OOS start directly from the global engine
+        oos_idx = int(self.prices.index.get_indexer([oos_start_date], method="ffill")[0])
+        stock_feats = self._global_engine.get_stock_features(oos_idx)
+        stock_feats = np.hstack([stock_feats, current_weights.reshape(-1, 1)]).astype(np.float32)
+        market_feats = self._global_engine.get_market_features(oos_idx)
+
+        # No-look-ahead: refit the HMM on prices/returns up to and including
+        # oos_start_date and read off the regime probabilities at that date.
+        if self.feat_config.use_regime:
+            hist_prices = self.prices.loc[:oos_start_date]
+            hist_returns = self.returns.loc[:oos_start_date]
+            regime_fc = FeatureConstructor(
+                hist_prices, self.feat_config, returns=hist_returns,
+                precomputed_features=self._global_features,
+            )
+            regime_at_oos = regime_fc._features["regime"].iloc[-1].values.astype(np.float32)
+            market_feats = np.concatenate([market_feats, regime_at_oos]).astype(np.float32)
 
         # Get deterministic action
+        agent.reset_hidden_state()
+
+        # LSTM warmup: step the hidden state through the most recent prior
+        # rebalance dates so it isn't zero at the OOS prediction.
+        n_warmup = self.wf_config.lstm_warmup_steps
+        if agent.ac.lstm is not None and n_warmup > 0:
+            prior_ends = [w[1] for w in self._windows if w[1] < oos_start_date][-n_warmup:]
+            if prior_ends:
+                regime_pad = (
+                    np.full(self.feat_config.n_regimes,
+                            1.0 / self.feat_config.n_regimes, dtype=np.float32)
+                    if self.feat_config.use_regime else None
+                )
+                warmup_mfs = []
+                for d in prior_ends:
+                    i = int(self.prices.index.get_indexer([d], method="ffill")[0])
+                    mf = self._global_engine.get_market_features(i).astype(np.float32)
+                    if regime_pad is not None:
+                        mf = np.concatenate([mf, regime_pad])
+                    warmup_mfs.append(mf)
+                agent.warmup_lstm(warmup_mfs)
+
         action, _, _ = agent.select_action(
             stock_feats, market_feats, deterministic=True
         )

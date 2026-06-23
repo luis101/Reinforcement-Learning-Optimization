@@ -42,6 +42,7 @@ class PortfolioEnv:
         target_returns: pd.DataFrame | None = None,
         env_config: EnvironmentConfig | None = None,
         feature_config: FeatureConfig | None = None,
+        precomputed_features: dict | None = None,
     ):
         """
         Args:
@@ -51,6 +52,9 @@ class PortfolioEnv:
             feature_config: Feature engineering configuration.
             returns: Pre-computed returns aligned with prices. If provided, skips pct_change
                      and winsorization. Should already be cleaned (winsorized, fillna(0)).
+            precomputed_features: Optional globally precomputed feature DataFrames passed through
+                     to FeatureConstructor. Eliminates the train/OOS distribution shift caused
+                     by per-window rolling normalization.
         """
         self.config = env_config or EnvironmentConfig()
         self.prices = prices
@@ -64,7 +68,10 @@ class PortfolioEnv:
         self.target_returns = target_returns
 
         # Feature engine — pass returns to avoid recomputing pct_change
-        self.feature_engine = FeatureConstructor(prices, feature_config, returns=self.returns)
+        self.feature_engine = FeatureConstructor(
+            prices, feature_config, returns=self.returns,
+            precomputed_features=precomputed_features,
+        )
 
         # Compute rebalancing schedule
         self._rebalance_dates = self._build_rebalance_schedule()
@@ -98,6 +105,10 @@ class PortfolioEnv:
         self._portfolio_values = [1.0]  # Start with unit value
         self._trade_history = []
         self._all_daily_returns = []
+
+        # DSR running EMAs of first and second moments of net returns (Moody & Saffell)
+        self._dsr_A = 0.0
+        self._dsr_B = 0.0
 
         return self._get_state()
 
@@ -371,6 +382,23 @@ class PortfolioEnv:
         elif reward_type == "mse":
             reward = -((net_return - target_return) ** 2)
 
+        elif reward_type == "dsr":
+            # Differential Sharpe Ratio (Moody & Saffell 1998): per-step marginal
+            # contribution of net_return to a moving-window Sharpe estimate. Maintains
+            # EMAs of the first (A) and second (B) moments and reads off the closed-form
+            # derivative. Bounded, well-credit-assigned per step.
+            eta = self.config.dsr_eta
+            A_prev, B_prev = self._dsr_A, self._dsr_B
+            dA = net_return - A_prev
+            dB = net_return * net_return - B_prev
+            denom = (B_prev - A_prev * A_prev) ** 1.5
+            if denom < 1e-8:
+                reward = 0.0
+            else:
+                reward = (B_prev * dA - 0.5 * A_prev * dB) / denom
+            self._dsr_A = A_prev + eta * dA
+            self._dsr_B = B_prev + eta * dB
+
         elif reward_type == "sharpe" or reward_type == "combined":
             # Use all accumulated episode returns for a stable Sharpe estimate.
             # Early steps are still noisy, but the estimate improves each period.
@@ -378,6 +406,8 @@ class PortfolioEnv:
                 np.concatenate(self._all_daily_returns)
                 if self._all_daily_returns else daily_returns
             )
+            if len(episode_returns) > self.config.sharpe_window:
+                episode_returns = episode_returns[-self.config.sharpe_window:]
             if len(episode_returns) < 2:
                 return 0.0
             daily_rf = self.config.risk_free_rate / 252

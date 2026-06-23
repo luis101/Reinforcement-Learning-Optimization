@@ -9,6 +9,8 @@ look-ahead bias.
 import numpy as np
 import pandas as pd
 
+from hmmlearn.hmm import GaussianHMM as _GaussianHMM
+
 from .config import FeatureConfig
 
 
@@ -16,7 +18,8 @@ class FeatureConstructor:
     """Computes and caches features from price data."""
 
     def __init__(self, prices: pd.DataFrame, config: FeatureConfig | None = None,
-                 returns: pd.DataFrame | None = None):
+                 returns: pd.DataFrame | None = None,
+                 precomputed_features: dict[str, pd.DataFrame] | None = None):
         """
         Args:
             prices: DataFrame with DatetimeIndex rows (days) and stock and/or asset columns.
@@ -24,15 +27,37 @@ class FeatureConstructor:
             config: Feature configuration. Uses defaults if None.
             returns: Pre-computed returns aligned with prices. If provided, skips pct_change.
                      Price-level features (MACD, Bollinger) still use prices.
+            precomputed_features: Optional dict of {feature_name: DataFrame} computed externally
+                     on a wider date range. When provided, features for this instance are
+                     sliced from these (using prices.index) instead of being recomputed.
+                     This eliminates per-window rolling-normalization distribution shift
+                     between training and OOS application.
         """
         self.config = config or FeatureConfig()
         self.prices = prices
         self.n_stocks = prices.shape[1]
         self.returns = returns if returns is not None else prices.pct_change()
+        self._using_precomputed = precomputed_features is not None
 
         # Pre-compute all features (stored as DataFrames aligned to prices index)
         self._features: dict[str, pd.DataFrame] = {}
-        self._build_features()
+        if self._using_precomputed:
+            # Slice each globally computed feature DataFrame to this window's date range.
+            self._features = {
+                name: df.loc[prices.index]
+                for name, df in precomputed_features.items()
+            }
+            # When regime is configured but not present in the precomputed dict, fit
+            # the HMM locally on this instance's returns. The walk-forward engine uses
+            # this path to keep regime free of full-history look-ahead: globals omit
+            # regime, and every training window / OOS query refits on data ≤ its own
+            # end date.
+            if self.config.use_regime and "regime" not in self._features:
+                self._build_regime_features()
+        else:
+            self._build_features()
+            if self.config.use_regime:
+                self._build_regime_features()
 
     def get_state_features(self, date_idx: int) -> np.ndarray:
         """
@@ -100,7 +125,13 @@ class FeatureConstructor:
 
     @property
     def valid_start_idx(self) -> int:
-        """First index where all features are valid (no NaNs from warmup)."""
+        """First index where all features are valid (no NaNs from warmup).
+
+        When features were precomputed on a wider date range, the warmup is
+        already absorbed there, so we can start from the beginning of the slice.
+        """
+        if self._using_precomputed:
+            return 0
         return self.config.normalize_window + max(
             max(self.config.return_windows),
             self.config.macd_slow + self.config.macd_signal,
@@ -180,6 +211,8 @@ class FeatureConstructor:
         window = self.config.normalize_window
 
         for name, df in self._features.items():
+            if name == "regime":
+                continue  # already in [0, 1], probabilities need no normalization
             if method == "zscore":
                 rolling_mean = df.rolling(window, min_periods=1).mean()
                 rolling_std = df.rolling(window, min_periods=1).std().replace(0, 1)
@@ -229,3 +262,52 @@ class FeatureConstructor:
         band_width = (upper - lower).replace(0, 1e-10)
         position = (prices - lower) / band_width * 2 - 1  # Map to [-1, 1]
         return position.clip(-2, 2)
+
+
+    # Regime detection
+
+    def _build_regime_features(self) -> None:
+        """
+        Fit a Gaussian HMM on market observations and store predicted
+        next-step regime probabilities as market features.
+
+        Observations (T, 2):
+          equal-weight daily market return  (T,)
+          rolling realised vol of market return, window = regime_vol_window  (T,)
+        Both are 1-dimensional series stacked column-wise → shape (T, 2).
+
+        Output: DataFrame (T, n_regimes) stored as self._features["regime"].
+        Probabilities are in [0, 1] and sum to 1 — no further normalisation needed.
+        """
+
+        vol_w = self.config.regime_vol_window
+
+        # Equal-weight market return: mean across stocks at each day → shape (T,)
+        mkt_ret: np.ndarray = self.returns.mean(axis=1).values
+
+        # Realised vol: rolling std of mkt_ret → shape (T,)
+        mkt_vol: np.ndarray = (
+            pd.Series(mkt_ret).rolling(vol_w).std().fillna(0).values
+        )
+
+        obs = np.column_stack([mkt_ret, mkt_vol]).astype(np.float64)  # (T, 2)
+
+        model = _GaussianHMM(
+            n_components=self.config.n_regimes,
+            covariance_type="diag",
+            n_iter=100,
+            tol=0.0001,
+            # random_state=42,
+        )
+        model.fit(obs)
+
+        # posteriors[t] = P(z_t | o_0, … o_t)  shape (T, K)
+        posteriors = model.predict_proba(obs)
+
+        # next-step prediction: A^T @ posterior_t  shape (T, K)
+        next_proba = posteriors @ model.transmat_.T
+        next_proba /= next_proba.sum(axis=1, keepdims=True) + 1e-300
+
+        cols = [f"regime_{k}" for k in range(self.config.n_regimes)]
+        self._features["regime"] = pd.DataFrame(
+            next_proba, index=self.prices.index, columns=cols).fillna(1.0 / self.config.n_regimes)

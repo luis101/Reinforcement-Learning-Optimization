@@ -171,6 +171,52 @@ class PPOAgent:
         # Training statistics
         self.train_stats: list[dict] = []
 
+        # LSTM hidden state — maintained across steps within one episode.
+        # reset_hidden_state() must be called at the start of every episode.
+        self._lstm_h: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        # Per-window active-stock mask, (1, n_stocks) bool tensor or None
+        self._action_mask_t: torch.Tensor | None = None
+
+    def reset_hidden_state(self) -> None:
+        """
+        Reset the LSTM hidden state to zero.
+
+        Called by:
+          - Train.train()      at the start of each training episode
+          - _apply_oos()       before deterministic OOS weight selection
+        """
+        self._lstm_h = None
+
+    def set_action_mask(self, mask: np.ndarray | None) -> None:
+        """
+        Store the active-stock mask used by the critic's masked pooling.
+
+        Called by Train.train() at the start of each window
+        """
+        if mask is None:
+            self._action_mask_t = None
+        else:
+            self._action_mask_t = torch.as_tensor(
+                mask, dtype=torch.bool, device=self.device
+            ).view(1, -1)
+
+    def warmup_lstm(self, market_feats_sequence) -> None:
+        """
+        Step the LSTM through a sequence of market feature vectors, updating
+        ``self._lstm_h`` in place. No-op if LSTM is disabled.
+
+        Used by walk-forward OOS to bring the hidden state into the same
+        regime that training episodes left it in by their final step,
+        instead of cold-starting from zero at every OOS prediction.
+        """
+        if self.ac.lstm is None:
+            return
+        with torch.no_grad():
+            for mf in market_feats_sequence:
+                mf_t = torch.FloatTensor(mf).unsqueeze(0).to(self.device)
+                _, self._lstm_h = self.ac.lstm_step(mf_t, self._lstm_h)
+
     def select_action(self,
         stock_features: np.ndarray, market_features: np.ndarray,
         deterministic: bool = False
@@ -187,8 +233,10 @@ class PPOAgent:
             sf = torch.FloatTensor(stock_features).unsqueeze(0).to(self.device)
             mf = torch.FloatTensor(market_features).unsqueeze(0).to(self.device)
 
-            action, log_prob = self.ac.actor.get_action(sf, mf, deterministic)
-            value = self.ac.critic(sf, mf)
+            # Augment market features with LSTM context (no-op when LSTM disabled)
+            mf_aug, self._lstm_h = self.ac.lstm_step(mf, self._lstm_h)
+            action, log_prob = self.ac.actor.get_action(sf, mf_aug, deterministic, self._action_mask_t)
+            value = self.ac.critic(sf, mf_aug, self._action_mask_t)
 
         return (
             action.squeeze(0).cpu().numpy(),
@@ -205,14 +253,17 @@ class PPOAgent:
         returns = batch["returns"]
         advantages = batch["advantages"]
 
+        # Augment market features via LSTM (hidden=None → zero-init per sample)
+        mf_aug, _ = self.ac.lstm_step(mf)
+
         # Current policy evaluation
-        mean, std = self.ac.actor.forward(sf, mf)
+        mean, std = self.ac.actor.forward(sf, mf_aug, self._action_mask_t)
         dist = torch.distributions.Normal(mean, std)
         new_log_probs = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1).mean()
 
         # Current value estimate
-        values = self.ac.critic(sf, mf)
+        values = self.ac.critic(sf, mf_aug, self._action_mask_t)
 
         # Policy loss (clipped PPO objective)
         ratio = torch.exp(new_log_probs - old_log_probs)
@@ -230,16 +281,14 @@ class PPOAgent:
         else:  # huber
             value_loss = F.smooth_l1_loss(values, returns)
 
-        # Update actor
+        # Combined backward pass — actor and critic share the LSTM graph
+        total_loss = policy_loss + self.config.value_loss_coeff * value_loss
         self.actor_optimizer.zero_grad()
-        policy_loss.backward()
-        nn.utils.clip_grad_norm_(self.ac.actor.parameters(), self.config.max_grad_norm)
-        self.actor_optimizer.step()
-
-        # Update critic
         self.critic_optimizer.zero_grad()
-        (self.config.value_loss_coeff * value_loss).backward()
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(self.ac.actor.parameters(), self.config.max_grad_norm)
         nn.utils.clip_grad_norm_(self.ac.critic.parameters(), self.config.max_grad_norm)
+        self.actor_optimizer.step()
         self.critic_optimizer.step()
 
         # Diagnostics
@@ -280,7 +329,8 @@ class PPOAgent:
             with torch.no_grad():
                 sf = torch.FloatTensor(last_transition.stock_features).unsqueeze(0).to(self.device)
                 mf = torch.FloatTensor(last_transition.market_features).unsqueeze(0).to(self.device)
-                last_value = self.ac.critic(sf, mf).item()
+                mf_aug, _ = self.ac.lstm_step(mf)
+                last_value = self.ac.critic(sf, mf_aug, self._action_mask_t).item()
 
         # Compute returns and advantages
         returns, advantages = self.buffer.compute_returns_and_advantages(
@@ -348,6 +398,7 @@ class PPOAgent:
         """Load agent state."""
         checkpoint = torch.load(path, map_location=self.device)
         self.ac.load_state_dict(checkpoint["ac_state_dict"])
+        self.ac.flatten_lstm_parameters()
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.train_stats = checkpoint.get("train_stats", [])

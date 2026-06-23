@@ -44,10 +44,11 @@ class CrossAssetAttention(nn.Module):
         self.norm = nn.LayerNorm(attention_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, n_stocks, input_dim) per-stock features.
+            mask: optional (1, n_stocks) or (batch, n_stocks) tensor, mask for active stocks
 
         Returns:
             (batch, n_stocks, attention_dim) attention-processed features.
@@ -60,7 +61,11 @@ class CrossAssetAttention(nn.Module):
 
         # Scaled dot-product attention
         scale = self.head_dim ** 0.5
-        attn = (q @ k.transpose(-2, -1)) / scale
+        attn = (q @ k.transpose(-2, -1)) / scale  # (B, heads, N_query, N_key)
+        if mask is not None:
+            # Key mask: Not attending to inactive assets (B or 1, 1, 1, N_key)
+            key_mask = mask.reshape(-1, 1, 1, N).bool()
+            attn = attn.masked_fill(~key_mask, torch.finfo(attn.dtype).min)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
@@ -145,19 +150,40 @@ class ActorNetwork(nn.Module):
 
         # Stock embedding aggregation
         act_fn = {"relu": nn.ReLU(), "gelu": nn.GELU(), "silu": nn.SiLU()}[activation]
-        self.stock_compress = nn.Sequential(
-            nn.Linear(stock_embed_dim, 32),
-            act_fn,
-        )
+        self.policy_head_type = net_config.policy_head
+        self.use_two_stage = net_config.use_two_stage
 
-        # Combine compressed stock features + market features
-        combined_dim = n_stocks * 32 + market_feature_dim
+        if self.policy_head_type == "flatten_mlp":
+            # Original: compress per-stock to 32, flatten, MLP -> n_stocks logits.
+            # Both first hidden layer and output layer are position-specific.
+            self.stock_compress = nn.Sequential(
+                nn.Linear(stock_embed_dim, 32),
+                act_fn,
+            )
+            policy_input_dim = n_stocks * 32 + market_feature_dim
+            policy_output_dim = n_stocks
+        elif self.policy_head_type == "shared_head_compressed":
+            # Compress per-stock to 32, then apply a shared per-stock MLP to
+            # each stock's (32 + market) vector. Permutation-equivariant.
+            self.stock_compress = nn.Sequential(
+                nn.Linear(stock_embed_dim, 32),
+                act_fn,
+            )
+            policy_input_dim = 32 + market_feature_dim
+            policy_output_dim = 1
+        elif self.policy_head_type == "shared_head":
+            # No compression — apply a shared per-stock MLP directly on the full
+            # attention output + market features per stock.
+            self.stock_compress = None
+            policy_input_dim = stock_embed_dim + market_feature_dim
+            policy_output_dim = 1
+        else:
+            raise ValueError(f"Unknown policy_head: {self.policy_head_type}")
 
-        # Policy head
         self.policy_mlp = MLP(
-            input_dim=combined_dim,
+            input_dim=policy_input_dim,
             hidden_dims=net_config.actor_hidden_dims,
-            output_dim=n_stocks,
+            output_dim=policy_output_dim,
             activation=net_config.activation,
             dropout=net_config.dropout,
             use_layer_norm=net_config.use_layer_norm,
@@ -174,6 +200,10 @@ class ActorNetwork(nn.Module):
             nn.init.normal_(out_layer.weight, mean=0.0, std=0.01)
         elif init == "xavier":
             nn.init.xavier_uniform_(out_layer.weight)
+        elif init == "kaiming_uniform":
+            nn.init.kaiming_uniform_(out_layer.weight, mode="fan_in", nonlinearity="relu")
+        elif init == "kaiming_normal":
+            nn.init.kaiming_normal_(out_layer.weight, mode="fan_in", nonlinearity="relu")
         nn.init.zeros_(out_layer.bias)
 
         # Learnable log standard deviation
@@ -181,13 +211,35 @@ class ActorNetwork(nn.Module):
         self.log_std_min = net_config.actor_log_std_min
         self.log_std_max = net_config.actor_log_std_max
 
-    def forward(self, 
-                stock_features: torch.Tensor, market_features: torch.Tensor
+        # Optional two-stage inclusion gate: log_sigmoid(gate_logit) is added to
+        # action logits before softmax, softly zeroing low-conviction stocks
+        # without forcing hard full-position entry or exit.
+        if self.use_two_stage:
+            if self.policy_head_type == "flatten_mlp":
+                self.inclusion_head = nn.Linear(policy_input_dim, n_stocks)
+            else:
+                self.inclusion_head = nn.Linear(policy_input_dim, 1)
+            nn.init.orthogonal_(self.inclusion_head.weight, gain=0.01)
+            nn.init.zeros_(self.inclusion_head.bias)
+
+        # Learnable softmax temperature: concentrates weights as it decreases.
+        # Initialised at temperature_init (≈1 → near-uniform) and learned from data.
+        self.use_temperature = net_config.use_temperature
+        if self.use_temperature:
+            self.temperature = nn.Parameter(
+                torch.full((1,), net_config.temperature_init)
+            )
+            self.temperature_min = net_config.temperature_min
+
+    def forward(self,
+                stock_features: torch.Tensor, market_features: torch.Tensor,
+                mask: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             stock_features: (batch, n_stocks, stock_feature_dim)
             market_features: (batch, market_feature_dim)
+            mask: optional (1, n_stocks) tensor, mask for active stocks
 
         Returns:
             action_mean: (batch, n_stocks) raw action means
@@ -197,18 +249,39 @@ class ActorNetwork(nn.Module):
 
         # Cross-asset attention
         if self.use_attention:
-            stock_embed = self.attention(stock_features)  # (B, N, attn_dim)
+            stock_embed = self.attention(stock_features, mask)  # (B, N, attn_dim)
         else:
             stock_embed = stock_features
 
-        # Compress per-stock embeddings
-        stock_compressed = self.stock_compress(stock_embed)  # (B, N, 32)
-        stock_flat = stock_compressed.view(B, -1)  # (B, N*32)
-        # Combine with market features
-        combined = torch.cat([stock_flat, market_features], dim=-1)
+        if self.policy_head_type == "flatten_mlp":
+            # Compress per-stock embeddings, flatten, append market features, then
+            # MLP -> n_stocks logits (position-specific).
+            stock_compressed = self.stock_compress(stock_embed)  # (B, N, 32)
+            stock_flat = stock_compressed.view(B, -1)            # (B, N*32)
+            policy_input = torch.cat([stock_flat, market_features], dim=-1)
+            action_mean = self.policy_mlp(policy_input)          # (B, N)
+            if self.use_two_stage:
+                action_mean = action_mean + F.logsigmoid(self.inclusion_head(policy_input))
+        else:
+            # Shared per-stock head: apply the same MLP to every stock's
+            # (embedding + broadcast market features) vector and read off one logit each.
+            if self.stock_compress is not None:
+                stock_embed = self.stock_compress(stock_embed)   # (B, N, 32)
+            N = stock_embed.shape[1]
+            mkt_exp = market_features.unsqueeze(1).expand(-1, N, -1)  # (B, N, M)
+            policy_input = torch.cat([stock_embed, mkt_exp], dim=-1)  # (B, N, embed+M)
+            action_mean = self.policy_mlp(policy_input).squeeze(-1)   # (B, N)
+            # Two-stage gate: adds log P(include | state) to logits before softmax.
+            # Stocks the gate assigns low probability to get subtracted from their
+            # logit, driving their softmax weight toward zero without hard selection.
+            if self.use_two_stage:
+                gate = self.inclusion_head(policy_input).squeeze(-1)  # (B, N)
+                action_mean = action_mean + F.logsigmoid(gate)
 
-        # Policy output
-        action_mean = self.policy_mlp(combined)  # (B, N)
+        # Temperature scaling: divides logits to sharpen the softmax distribution.
+        # A lower temperature concentrates weight on fewer high-conviction stocks.
+        if self.use_temperature:
+            action_mean = action_mean / self.temperature.clamp(min=self.temperature_min)
 
         # Clamped log_std → std
         log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
@@ -217,9 +290,9 @@ class ActorNetwork(nn.Module):
 
         return action_mean, action_std
 
-    def get_action(self, 
+    def get_action(self,
         stock_features: torch.Tensor, market_features: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False, mask: torch.Tensor | None = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample an action and compute its log probability.
@@ -229,7 +302,7 @@ class ActorNetwork(nn.Module):
             log_prob: (batch,) log probability of the action
         """
         # Get the action distribution
-        mean, std = self.forward(stock_features, market_features)
+        mean, std = self.forward(stock_features, market_features, mask)
         dist = torch.distributions.Normal(mean, std)
 
         if deterministic:
@@ -275,8 +348,13 @@ class CriticNetwork(nn.Module):
             nn.Linear(stock_embed_dim, 32),
             act_fn,
         )
-
-        combined_dim = n_stocks * 32 + market_feature_dim
+        
+        # Permutation-invariant aggregation: mean + max pool over the stock axis.
+        # V(s) must not depend on stock ordering (or count), so we pool with symmetric
+        # functions instead of flattening N*32, which tied the value to slot position.
+        #combined_dim = n_stocks * 32 + market_feature_dim
+        pooled_dim = 32 * 2  # mean concat max
+        combined_dim = pooled_dim + market_feature_dim
 
         self.value_mlp = MLP(
             input_dim=combined_dim,
@@ -287,28 +365,43 @@ class CriticNetwork(nn.Module):
             use_layer_norm=net_config.use_layer_norm,
         )
 
-    def forward(self, 
-                stock_features: torch.Tensor, market_features: torch.Tensor
+    def forward(self,
+                stock_features: torch.Tensor, market_features: torch.Tensor,
+                mask: torch.Tensor | None = None
                 ) -> torch.Tensor:
         """
         Args:
             stock_features: (batch, n_stocks, stock_feature_dim)
             market_features: (batch, market_feature_dim)
+            mask: optional (1, n_stocks) tensor, mask for active stocks
 
         Returns:
             value: (batch,) estimated state value
         """
-        B = stock_features.shape[0]
+        B, N, _ = stock_features.shape
 
         if self.use_attention:
-            stock_embed = self.attention(stock_features)
+            stock_embed = self.attention(stock_features, mask)
         else:
             stock_embed = stock_features
 
-        stock_compressed = self.stock_compress(stock_embed)
-        stock_flat = stock_compressed.view(B, -1)
+        stock_compressed = self.stock_compress(stock_embed) # (B, N, 32)
+        #stock_flat = stock_compressed.view(B, -1)
+        if mask is None:
+            pooled = torch.cat(
+                [stock_compressed.mean(dim=1), stock_compressed.amax(dim=1)],
+                dim=-1,
+            ) # (B, 64) - order-independent
+        else:
+            # Masked mean + max over active stocks only, m: (1, N, 1)
+            m = mask.reshape(1, N, 1).to(stock_compressed.dtype)
+            masked_mean = (stock_compressed * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+            neg_inf = torch.finfo(stock_compressed.dtype).min
+            masked_max = stock_compressed.masked_fill(m == 0, neg_inf).amax(dim=1)
+            pooled = torch.cat([masked_mean, masked_max], dim=-1) # (B, 64)
 
-        combined = torch.cat([stock_flat, market_features], dim=-1)
+        #combined = torch.cat([stock_flat, market_features], dim=-1)
+        combined = torch.cat([pooled, market_features], dim=-1)
         value = self.value_mlp(combined).squeeze(-1)
 
         return value
@@ -319,6 +412,8 @@ class ActorCritic(nn.Module):
     Combined Actor-Critic module.
 
     Wraps the actor and critic networks together, both have fully separate parameters.
+    An optional shared LSTM augments market features with temporal context carried
+    across rebalancing steps within each episode.
     """
 
     def __init__(self,
@@ -329,23 +424,67 @@ class ActorCritic(nn.Module):
         net_config = net_config or NetworkConfig()
         env_config = env_config or EnvironmentConfig()
 
+        # Optional LSTM: processes market features sequentially within an episode.
+        # Its output is concatenated to the raw market features, increasing the
+        # effective market_feature_dim seen by actor and critic.
+        self.lstm: nn.LSTM | None = None
+        actor_market_dim = market_feature_dim
+        if net_config.use_lstm:
+            self.lstm = nn.LSTM(
+                input_size=market_feature_dim,
+                hidden_size=net_config.lstm_hidden_dim,
+                batch_first=True,
+            )
+            actor_market_dim = market_feature_dim + net_config.lstm_hidden_dim
+
         self.actor = ActorNetwork(
-            n_stocks, stock_feature_dim, market_feature_dim,
+            n_stocks, stock_feature_dim, actor_market_dim,
             net_config, env_config,
         )
         self.critic = CriticNetwork(
-            n_stocks, stock_feature_dim, market_feature_dim,
+            n_stocks, stock_feature_dim, actor_market_dim,
             net_config,
         )
 
+    def lstm_step(
+        self,
+        market_features: torch.Tensor,
+        hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """
+        Augment market features with LSTM context.
+
+        Args:
+            market_features: (batch, market_feature_dim)
+            hidden: LSTM (h, c) state from the previous step, or None.
+
+        Returns:
+            augmented_market_features: (batch, market_feature_dim + lstm_hidden_dim)
+                                        or the original tensor when LSTM is disabled.
+            new_hidden: updated (h, c) tuple, or None when LSTM is disabled.
+        """
+        if self.lstm is None:
+            return market_features, None
+        self.lstm.flatten_parameters()
+        lstm_out, new_hidden = self.lstm(market_features.unsqueeze(1), hidden)
+        return torch.cat([market_features, lstm_out.squeeze(1)], dim=-1), new_hidden
+
+    def flatten_lstm_parameters(self) -> None:
+        """Call after load_state_dict or deepcopy to restore cuDNN-required contiguity."""
+        if self.lstm is not None:
+            self.lstm.flatten_parameters()
+
     def forward(self,
-                stock_features: torch.Tensor, market_features: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                stock_features: torch.Tensor, market_features: torch.Tensor,
+                hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
+                mask: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                           tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Returns:
-            action_mean, action_std, value
+            action_mean, action_std, value, new_hidden
         """
-        mean, std = self.actor(stock_features, market_features)
-        value = self.critic(stock_features, market_features)
-
-        return mean, std, value
+        mf_aug, new_hidden = self.lstm_step(market_features, hidden)
+        mean, std = self.actor(stock_features, mf_aug, mask)
+        value = self.critic(stock_features, mf_aug, mask)
+        return mean, std, value, new_hidden
