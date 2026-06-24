@@ -70,7 +70,7 @@ class PortfolioEnv:
         # Feature engine — pass returns to avoid recomputing pct_change
         self.feature_engine = FeatureConstructor(
             prices, feature_config, returns=self.returns,
-            precomputed_features=precomputed_features,
+            precomputed_features=precomputed_features
         )
 
         # Compute rebalancing schedule
@@ -84,6 +84,14 @@ class PortfolioEnv:
         self._trade_history: list[dict] = []
         self._all_daily_returns: list[np.ndarray] = []
 
+        # Block-bootstrap setup (training-episode diversity)
+        self._feature_config = feature_config
+        self._base_returns = self.returns
+        self._base_feature_engine = self.feature_engine
+        self._boot_rng = np.random.default_rng(self.config.bootstrap_seed)
+        self._reset_count = 0
+        self._syn_cache: tuple | None = None  # (returns, feature_engine, rebalance_dates)
+
     # Gym-like interface
 
     def reset(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -93,6 +101,21 @@ class PortfolioEnv:
         Returns:
             Tuple of (flat_state, stock_features, market_features).
         """
+        # Block-bootstrap: resample a fresh path and recompute features on it.
+        # Must run before reading _rebalance_dates below.
+        if self.config.use_bootstrap:
+            if self._syn_cache is None or self._reset_count % max(1, self.config.bootstrap_refresh_every) == 0:
+                idx = stationary_bootstrap_idx(
+                    len(self._base_returns), self.config.bootstrap_block, self._boot_rng)
+                syn_ret = pd.DataFrame(self._base_returns.values[idx],
+                    index=self._base_returns.index, columns=self._base_returns.columns)
+                self.returns = syn_ret
+                self.feature_engine = FeatureConstructor(
+                    100.0 * (1.0 + syn_ret).cumprod(), self._feature_config, returns=syn_ret)
+                self._syn_cache = (syn_ret, self.feature_engine, self._build_rebalance_schedule())
+            self._reset_count += 1
+            self.returns, self.feature_engine, self._rebalance_dates = self._syn_cache
+
         self._rebalance_idx = 0
         self._step_idx = self._rebalance_dates[0]
         self._current_weights = np.zeros(self.n_stocks, dtype=np.float32)
@@ -371,7 +394,8 @@ class PortfolioEnv:
         return total_return, daily_port_ret, period_returns
 
     def _compute_reward(
-        self, net_return: float, target_return: float, daily_returns: np.ndarray, turnover: float
+        self, net_return: float, target_return: float, 
+        daily_returns: np.ndarray, turnover: float
         ) -> float:
         """
         Compute reward based on configured reward type.
@@ -402,9 +426,27 @@ class PortfolioEnv:
             self._dsr_A = A_prev + eta * dA
             self._dsr_B = B_prev + eta * dB
 
-        elif reward_type == "sharpe" or reward_type == "combined":
-            # Use all accumulated episode returns for a stable Sharpe estimate.
-            # Early steps are still noisy, but the estimate improves each period.
+        elif reward_type == "sharpe":
+            # Terminal full-window Sharpe: 0 until the episode ends, then the annualized
+            # Sharpe of all daily portfolio returns accumulated over the episode.
+            done = self._rebalance_idx >= len(self._rebalance_dates)
+            if not done:
+                return 0.0
+            episode_returns = (
+                np.concatenate(self._all_daily_returns)
+                if self._all_daily_returns else daily_returns
+            )
+            if len(episode_returns) < 2:
+                return 0.0
+            ret_exc = episode_returns - self.config.risk_free_rate / 252
+            std_exc = ret_exc.std()
+            reward = (
+                ret_exc.mean() * np.sqrt(252) if std_exc < 1e-8
+                else (ret_exc.mean() / std_exc) * np.sqrt(252)
+            )
+
+        elif reward_type == "combined": # or reward_type == "sharpe":
+            # Accumulated-episode Sharpe minus drawdown and excess-turnover penalties.
             episode_returns = (
                 np.concatenate(self._all_daily_returns)
                 if self._all_daily_returns else daily_returns
@@ -413,30 +455,29 @@ class PortfolioEnv:
                 episode_returns = episode_returns[-self.config.sharpe_window:]
             if len(episode_returns) < 2:
                 return 0.0
-            daily_rf = self.config.risk_free_rate / 252
-            ret_exc = episode_returns - daily_rf
+            ret_exc = episode_returns - self.config.risk_free_rate / 252
             std_exc = ret_exc.std()
             sharpe = (
                 ret_exc.mean() * np.sqrt(252) if std_exc < 1e-8
                 else (ret_exc.mean() / std_exc) * np.sqrt(252)
             )
 
-            if reward_type == "sharpe":
-                reward = sharpe
-            else:  # combined
-                # Drawdown penalty
-                dd_penalty = 0.0
-                if len(self._portfolio_values) >= 2:
-                    peak = max(self._portfolio_values)
-                    current = self._portfolio_values[-1]
-                    drawdown = (peak - current) / peak
-                    dd_penalty = drawdown * self.config.drawdown_penalty
+            #if reward_type == "sharpe":
+            #    reward = sharpe
+            #else:  # combined
+            # Drawdown penalty
+            dd_penalty = 0.0
+            if len(self._portfolio_values) >= 2:
+                peak = max(self._portfolio_values)
+                current = self._portfolio_values[-1]
+                drawdown = (peak - current) / peak
+                dd_penalty = drawdown * self.config.drawdown_penalty
 
-                # Turnover penalty — only excess above threshold is penalized
-                excess_turnover = max(0.0, turnover - self.config.turnover_threshold)
-                turnover_penalty = excess_turnover * self.config.turnover_penalty
+            # Turnover penalty — only excess above threshold is penalized
+            excess_turnover = max(0.0, turnover - self.config.turnover_threshold)
+            turnover_penalty = excess_turnover * self.config.turnover_penalty
 
-                reward = sharpe - dd_penalty - turnover_penalty
+            reward = sharpe - dd_penalty - turnover_penalty
 
         else:
             raise ValueError(f"Unknown reward type: {reward_type}")
@@ -478,6 +519,8 @@ class MultiPeriodEnv:
         )
 
 
+# Utility functions
+
 def cap_long_only(w: np.ndarray, cap: float) -> np.ndarray:
     """
     Project nonnegative weights onto {0 <= w <= cap, sum w = 1}: clip to the cap,
@@ -497,4 +540,17 @@ def cap_long_only(w: np.ndarray, cap: float) -> np.ndarray:
             break
         w[w_avail] += res * w[w_avail] / fs
     return w
+
+def stationary_bootstrap_idx(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Determining row indices for stationary bootstrap: 
+    geometric-length circular blocks with mean length `block`. 
+    """
+    p = 1.0 / max(1, block)
+    idx = np.empty(n, dtype=np.int64)
+    t = int(rng.integers(n))
+    for i in range(n):
+        idx[i] = t
+        t = int(rng.integers(n)) if rng.random() < p else (t + 1) % n
+    return idx
 

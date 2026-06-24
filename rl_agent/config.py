@@ -44,6 +44,13 @@ class EnvironmentConfig:
     lookback_window: int = 252  # with 63 ~3 months of trading days
     warmup_period: int = 252  # Days needed before first valid state
 
+    # Block-bootstrap of returns for training-episode diversity (training-only). When enabled,
+    # each reset resamples a synthetic return path and recomputes features on it.
+    use_bootstrap: bool = False
+    bootstrap_block: int = 21          # mean block length in trading days (stationary bootstrap)
+    bootstrap_refresh_every: int = 5   # resample a new synthetic path every N resets (1, 5, 10, ...)
+    bootstrap_seed: int | None = None  # RNG seed for reproducibility
+
 
 @dataclass
 class BacktestConfig:
@@ -175,7 +182,7 @@ class TrainingConfig:
     # PPO hyperparameters
     lr_actor: float = 0.0005
     lr_critic: float = 0.001
-    gamma: float = 0.99  # Discount factor
+    gamma: float = 0.99  # Discount factor (0.999, 0.99, 0.9, 0.5, ...)
     gae_lambda: float = 0.95  # GAE lambda
     clip_epsilon: float = 0.2  # PPO clipping
     entropy_coeff: float = 0.001  # Entropy bonus for exploration 
